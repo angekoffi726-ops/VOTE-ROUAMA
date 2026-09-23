@@ -831,9 +831,17 @@
         "JOSIANE"
       ];
       const ADMIN_PIN = "84";
-      const LS_VOTED_KEY = "rouama_voted_electors_set";
 
-      // Application State
+      // Purge any legacy persistent storage that could block mobile refresh
+      try {
+        localStorage.removeItem("rouama_voted_electors_set");
+        localStorage.removeItem("rouama_voted_names");
+        localStorage.removeItem("rouama_last_voter");
+      } catch (e) {
+        console.warn("Storage cleanup notice:", e);
+      }
+
+      // Application State (Pure real-time, no persistent voter blocking)
       let state = {
         currentPage: 'accueil',
         scrutin: {
@@ -843,9 +851,7 @@
           totalElectors: 11
         },
         electors: {}, // { OTINEL: { name: 'OTINEL', hasVoted: false, votedAt: null } }
-        bulletins: [], // [ { id, choice, justification, timestamp } ]
-        votes: [], // [ { id, choice, justification, timestamp } ]
-        backendResults: null,
+        votes: [], // [ { id, choice, justification, timestamp } ] - Source unique du dépouillement
         currentElector: null,
         selectedChoice: null,
         justification: "",
@@ -859,28 +865,6 @@
           .replace(/[\u0300-\u036f]/g, '')
           .trim()
           .toUpperCase();
-      }
-
-      // LocalStorage duplicate prevention check
-      function getLocalVoted() {
-        try {
-          return JSON.parse(localStorage.getItem(LS_VOTED_KEY) || '[]');
-        } catch {
-          return [];
-        }
-      }
-
-      function addLocalVoted(name) {
-        try {
-          const list = getLocalVoted();
-          const norm = normalizeName(name);
-          if (!list.includes(norm)) {
-            list.push(norm);
-            localStorage.setItem(LS_VOTED_KEY, JSON.stringify(list));
-          }
-        } catch (e) {
-          console.error(e);
-        }
       }
 
       // View Router
@@ -919,26 +903,23 @@
               isClosed: false,
               areResultsPublished: false,
               candidateName: "WOYA SYLAS",
-              totalElectors: 11,
-              counters: {
-                oui: 0,
-                non: 0,
-                neutre: 0,
-                total: 0
-              }
+              totalElectors: 11
             });
           }
 
-          // Ensure all 11 electors exist in Firestore
+          // Ensure all 11 electors exist in both 'voters' and 'electors' in Firestore
           for (const name of AUTHORIZED_ELECTORS) {
             const electorRef = doc(db, "electors", name);
-            const snap = await getDoc(electorRef);
-            if (!snap.exists()) {
-              await setDoc(electorRef, {
-                name: name,
-                hasVoted: false,
-                votedAt: null
-              });
+            const voterRef = doc(db, "voters", name);
+            const [snapE, snapV] = await Promise.all([
+              getDoc(electorRef),
+              getDoc(voterRef)
+            ]);
+            if (!snapE.exists()) {
+              await setDoc(electorRef, { name: name, hasVoted: false, votedAt: null });
+            }
+            if (!snapV.exists()) {
+              await setDoc(voterRef, { name: name, hasVoted: false, votedAt: null });
             }
           }
         } catch (e) {
@@ -946,7 +927,7 @@
         }
       }
 
-      // Backend API Synchronization
+      // Backend API Synchronization (status & config only)
       async function syncFromBackend() {
         try {
           const res = await fetch('/api/status');
@@ -955,7 +936,6 @@
             if (data.isClosed !== undefined) state.scrutin.isClosed = Boolean(data.isClosed);
             if (data.areResultsPublished !== undefined) state.scrutin.areResultsPublished = Boolean(data.areResultsPublished);
             if (data.totalElectors) state.scrutin.totalElectors = data.totalElectors;
-            if (data.results) state.publicResults = data.results;
             updateUI();
           }
         } catch (e) {
@@ -971,16 +951,11 @@
               const d = await res.json();
               state.scrutin.isClosed = Boolean(d.isClosed);
               state.scrutin.areResultsPublished = Boolean(d.areResultsPublished);
-              if (d.electors) {
+              // Only supplement electors if Firestore electors list is empty
+              if (d.electors && Object.keys(state.electors).length === 0) {
                 const map = {};
                 d.electors.forEach(e => { map[e.name] = e; });
                 state.electors = map;
-              }
-              if (d.justifications) {
-                state.bulletins = d.justifications;
-              }
-              if (d.results) {
-                state.backendResults = d.results;
               }
               updateUI();
             }
@@ -1001,9 +976,20 @@
             }
           }, (err) => console.log("Config listener notice:", err.message));
 
-          // 2. Écoute en temps réel sur la liste des électeurs
+          // 2. Écoute en temps réel sur la liste des électeurs ('voters' et 'electors')
+          onSnapshot(collection(db, "voters"), (querySnap) => {
+            if (!querySnap.empty) {
+              const electorsMap = { ...state.electors };
+              querySnap.forEach((doc) => {
+                electorsMap[doc.id] = doc.data();
+              });
+              state.electors = electorsMap;
+              updateUI();
+            }
+          }, (err) => console.log("Voters listener notice:", err.message));
+
           onSnapshot(collection(db, "electors"), (querySnap) => {
-            const electorsMap = {};
+            const electorsMap = { ...state.electors };
             querySnap.forEach((doc) => {
               electorsMap[doc.id] = doc.data();
             });
@@ -1011,34 +997,17 @@
             updateUI();
           }, (err) => console.log("Electors listener notice:", err.message));
 
-          // 3. Écoute en temps réel sur la collection des bulletins (votes anonymisés)
-          onSnapshot(collection(db, "bulletins"), (querySnap) => {
-            const bulletins = [];
-            querySnap.forEach((doc) => {
-              bulletins.push({ id: doc.id, ...doc.data() });
-            });
-            state.bulletins = bulletins;
-            if (bulletins.length === 0 && (!state.votes || state.votes.length === 0)) {
-              state.backendResults = null;
-            }
-            updateUI();
-          }, (err) => console.log("Bulletins listener notice:", err.message));
-
-          // 4. Écoute en temps réel sur la collection des votes (votes anonymisés)
+          // 3. Écoute en temps réel sur la collection des votes ('votes')
+          // Le dépouillement et le total sont directement calculés à partir de la taille réelle de cette collection
           onSnapshot(collection(db, "votes"), (querySnap) => {
             const votesList = [];
             querySnap.forEach((doc) => {
               votesList.push({ id: doc.id, ...doc.data() });
             });
             state.votes = votesList;
-            if (state.bulletins.length === 0 && votesList.length > 0) {
-              state.bulletins = votesList;
-            }
-            if (votesList.length === 0 && state.bulletins.length === 0) {
-              state.backendResults = null;
-            }
             updateUI();
           }, (err) => console.log("Votes listener notice:", err.message));
+
         } catch (e) {
           console.log("Firestore setup note:", e.message);
         }
@@ -1048,35 +1017,24 @@
         setInterval(syncFromBackend, 3500);
       }
 
-      // Calculate tally (réactif et synchronisé en direct)
+      // Calculate tally (strictement et dynamiquement calculé sur la collection 'votes')
       function getTally() {
-        const voteList = (state.bulletins && state.bulletins.length > 0)
-          ? state.bulletins
-          : (state.votes && state.votes.length > 0 ? state.votes : []);
-
+        const votes = state.votes || [];
         let oui = 0;
         let non = 0;
         let neutre = 0;
 
-        if (voteList.length > 0) {
-          voteList.forEach((b) => {
-            const ch = (b.choice || '').toUpperCase();
-            if (ch === 'OUI') oui++;
-            else if (ch === 'NON') non++;
-            else if (ch === 'NEUTRE') neutre++;
-          });
-        } else if (state.backendResults && state.backendResults.total > 0) {
-          oui = state.backendResults.oui || 0;
-          non = state.backendResults.non || 0;
-          neutre = state.backendResults.neutre || 0;
-        }
+        votes.forEach((v) => {
+          const ch = (v.choice || '').toString().toUpperCase().trim();
+          if (ch === 'OUI') oui++;
+          else if (ch === 'NON') non++;
+          else if (ch === 'NEUTRE') neutre++;
+        });
 
-        const total = (voteList.length > 0)
-          ? voteList.length
-          : (state.backendResults && state.backendResults.total ? state.backendResults.total : 0);
-
+        const total = votes.length;
         const totalElectors = state.scrutin.totalElectors || 11;
         const participationPct = totalElectors > 0 ? Math.round((total / totalElectors) * 100) : 0;
+
         return {
           oui,
           non,
@@ -1168,37 +1126,118 @@
           }
         }
 
-        // 4. Admin Dashboard
-        if (state.currentPage === 'admin-dashboard') {
-          // Badges
-          const adminBadgeStatus = document.getElementById('admin-badge-scrutin-status');
-          const btnToggleClose = document.getElementById('btn-admin-toggle-close');
-          const adminBadgePublish = document.getElementById('admin-badge-publish-status');
-          const btnPublish = document.getElementById('btn-admin-publish-results');
-          const publishHelpText = document.getElementById('admin-publish-help-text');
+        // 4. Update Result Cards & Admin Dashboard directly from realtime 'votes' snapshot
+        // Both mobile and PC read data synchronously via onSnapshot
+        const statVoted = document.getElementById('stat-voted-count');
+        if (statVoted) {
+          const statTotal = document.getElementById('stat-total-electors');
+          if (statTotal) statTotal.textContent = tally.totalElectors;
+          statVoted.textContent = tally.total;
+          const statPending = document.getElementById('stat-pending-count');
+          if (statPending) statPending.textContent = Math.max(0, tally.totalElectors - tally.total);
+          const statPart = document.getElementById('stat-participation-pct');
+          if (statPart) statPart.textContent = `${tally.participationPct}%`;
 
+          const tallyOui = document.getElementById('admin-tally-oui');
+          if (tallyOui) tallyOui.textContent = tally.oui;
+          const tallyOuiPct = document.getElementById('admin-tally-oui-pct');
+          if (tallyOuiPct) tallyOuiPct.textContent = `${tally.ouiPct}%`;
+
+          const tallyNon = document.getElementById('admin-tally-non');
+          if (tallyNon) tallyNon.textContent = tally.non;
+          const tallyNonPct = document.getElementById('admin-tally-non-pct');
+          if (tallyNonPct) tallyNonPct.textContent = `${tally.nonPct}%`;
+
+          const tallyNeutre = document.getElementById('admin-tally-neutre');
+          if (tallyNeutre) tallyNeutre.textContent = tally.neutre;
+          const tallyNeutrePct = document.getElementById('admin-tally-neutre-pct');
+          if (tallyNeutrePct) tallyNeutrePct.textContent = `${tally.neutrePct}%`;
+
+          // Electors grid (reflects hasVoted status in real-time)
+          const electorsGrid = document.getElementById('admin-electors-grid');
+          if (electorsGrid) {
+            electorsGrid.innerHTML = AUTHORIZED_ELECTORS.map((name) => {
+              const electorData = state.electors[name] || {};
+              const hasVoted = Boolean(electorData.hasVoted);
+              return `
+                <div class="p-2.5 rounded-xl border flex items-center justify-between ${
+                  hasVoted ? 'bg-emerald-50/60 border-emerald-300' : 'bg-orange-50/40 border-orange-200'
+                }">
+                  <div class="flex items-center gap-2">
+                    <div class="w-2 h-2 rounded-full ${hasVoted ? 'bg-emerald-500' : 'bg-slate-300'}"></div>
+                    <span class="text-xs font-bold text-slate-800">${name}</span>
+                  </div>
+                  <span class="text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                    hasVoted ? 'bg-emerald-100 text-emerald-800 border border-emerald-300' : 'bg-slate-200 text-slate-600'
+                  }">
+                    ${hasVoted ? 'A VOTÉ' : 'EN ATTENTE'}
+                  </span>
+                </div>
+              `;
+            }).join('');
+          }
+
+          // Justifications list
+          const justifContainer = document.getElementById('admin-justifications-list');
+          if (justifContainer) {
+            const justifItems = (state.votes || []).filter((b) => b.justification && b.justification.trim().length > 0);
+            if (justifItems.length === 0) {
+              justifContainer.innerHTML = `<p class="text-slate-400 italic text-center py-4">Aucune justification enregistrée pour le moment.</p>`;
+            } else {
+              justifContainer.innerHTML = justifItems.map((item, idx) => `
+                <div class="p-3 rounded-xl ${item.choice === 'NON' ? 'bg-rose-50 border border-rose-200' : 'bg-amber-50 border border-amber-200'} space-y-1">
+                  <div class="flex items-center justify-between">
+                    <span class="font-bold text-[11px] ${item.choice === 'NON' ? 'text-rose-700' : 'text-amber-700'}">
+                      Bulletin anonyme #${idx + 1} — Choix : ${item.choice}
+                    </span>
+                    <span class="text-[10px] text-slate-400">
+                      ${item.timestamp ? new Date(item.timestamp).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : ''}
+                    </span>
+                  </div>
+                  <p class="text-slate-800 text-xs leading-relaxed italic">"${item.justification}"</p>
+                </div>
+              `).join('');
+            }
+          }
+        }
+
+        // Admin Action Controls
+        const adminBadgeStatus = document.getElementById('admin-badge-scrutin-status');
+        const btnToggleClose = document.getElementById('btn-admin-toggle-close');
+        const adminBadgePublish = document.getElementById('admin-badge-publish-status');
+        const btnPublish = document.getElementById('btn-admin-publish-results');
+        const publishHelpText = document.getElementById('admin-publish-help-text');
+
+        if (adminBadgeStatus && btnToggleClose && btnPublish) {
           if (state.scrutin.isClosed) {
             adminBadgeStatus.textContent = 'Clôturé';
             adminBadgeStatus.className = 'px-2 py-0.5 rounded-full font-bold text-[11px] bg-rose-100 text-rose-800 border border-rose-200';
             btnToggleClose.textContent = 'ROUVRIR LE SCRUTIN';
             btnToggleClose.className = 'w-full py-2.5 px-4 rounded-xl font-bold text-white text-xs bg-slate-700 hover:bg-slate-800 shadow-sm transition-all cursor-pointer';
 
-            // Publish button is enabled if closed!
             btnPublish.disabled = false;
             if (state.scrutin.areResultsPublished) {
               btnPublish.textContent = 'MASQUER LES RÉSULTATS (DÉPUBLIER)';
               btnPublish.className = 'w-full py-2.5 px-4 rounded-xl font-bold text-slate-800 text-xs bg-amber-200 hover:bg-amber-300 shadow-sm transition-all cursor-pointer';
-              adminBadgePublish.textContent = 'Publics';
-              adminBadgePublish.className = 'px-2 py-0.5 rounded-full font-bold text-[11px] bg-emerald-100 text-emerald-800 border border-emerald-200';
-              publishHelpText.textContent = 'Les résultats sont actuellement visibles par tous.';
-              publishHelpText.className = 'text-[11px] text-emerald-700 font-medium';
+              if (adminBadgePublish) {
+                adminBadgePublish.textContent = 'Publics';
+                adminBadgePublish.className = 'px-2 py-0.5 rounded-full font-bold text-[11px] bg-emerald-100 text-emerald-800 border border-emerald-200';
+              }
+              if (publishHelpText) {
+                publishHelpText.textContent = 'Les résultats sont actuellement visibles par tous.';
+                publishHelpText.className = 'text-[11px] text-emerald-700 font-medium';
+              }
             } else {
               btnPublish.textContent = 'PUBLIER LES RÉSULTATS';
               btnPublish.className = 'w-full py-2.5 px-4 rounded-xl font-bold text-white text-xs bg-orange-600 hover:bg-orange-700 shadow-sm transition-all cursor-pointer';
-              adminBadgePublish.textContent = 'Confidentiels';
-              adminBadgePublish.className = 'px-2 py-0.5 rounded-full font-bold text-[11px] bg-slate-200 text-slate-700';
-              publishHelpText.textContent = 'Le scrutin est clôturé : vous pouvez maintenant publier les résultats.';
-              publishHelpText.className = 'text-[11px] text-emerald-700 font-medium';
+              if (adminBadgePublish) {
+                adminBadgePublish.textContent = 'Confidentiels';
+                adminBadgePublish.className = 'px-2 py-0.5 rounded-full font-bold text-[11px] bg-slate-200 text-slate-700';
+              }
+              if (publishHelpText) {
+                publishHelpText.textContent = 'Le scrutin est clôturé : vous pouvez maintenant publier les résultats.';
+                publishHelpText.className = 'text-[11px] text-emerald-700 font-medium';
+              }
             }
           } else {
             adminBadgeStatus.textContent = 'Ouvert';
@@ -1206,72 +1245,23 @@
             btnToggleClose.textContent = 'CLÔTURER LE SCRUTIN';
             btnToggleClose.className = 'w-full py-2.5 px-4 rounded-xl font-bold text-white text-xs bg-rose-600 hover:bg-rose-700 shadow-sm transition-all cursor-pointer';
 
-            // Publish button MUST remain disabled while open!
             btnPublish.disabled = true;
             btnPublish.textContent = 'PUBLIER LES RÉSULTATS';
             btnPublish.className = 'w-full py-2.5 px-4 rounded-xl font-bold text-white text-xs bg-orange-600 hover:bg-orange-700 disabled:bg-slate-300 disabled:cursor-not-allowed shadow-sm transition-all cursor-not-allowed';
-            adminBadgePublish.textContent = 'Confidentiels';
-            adminBadgePublish.className = 'px-2 py-0.5 rounded-full font-bold text-[11px] bg-slate-200 text-slate-700';
-            publishHelpText.textContent = '(Désactivé tant que le scrutin n\'est pas clôturé)';
-            publishHelpText.className = 'text-[11px] text-amber-700 font-medium';
+            if (adminBadgePublish) {
+              adminBadgePublish.textContent = 'Confidentiels';
+              adminBadgePublish.className = 'px-2 py-0.5 rounded-full font-bold text-[11px] bg-slate-200 text-slate-700';
+            }
+            if (publishHelpText) {
+              publishHelpText.textContent = '(Désactivé tant que le scrutin n\'est pas clôturé)';
+              publishHelpText.className = 'text-[11px] text-amber-700 font-medium';
+            }
           }
+        }
 
-          // Stats
-          document.getElementById('stat-total-electors').textContent = tally.totalElectors;
-          document.getElementById('stat-voted-count').textContent = tally.total;
-          document.getElementById('stat-pending-count').textContent = Math.max(0, tally.totalElectors - tally.total);
-          document.getElementById('stat-participation-pct').textContent = `${tally.participationPct}%`;
-
-          // Tally
-          document.getElementById('admin-tally-oui').textContent = tally.oui;
-          document.getElementById('admin-tally-oui-pct').textContent = `${tally.ouiPct}%`;
-          document.getElementById('admin-tally-non').textContent = tally.non;
-          document.getElementById('admin-tally-non-pct').textContent = `${tally.nonPct}%`;
-          document.getElementById('admin-tally-neutre').textContent = tally.neutre;
-          document.getElementById('admin-tally-neutre-pct').textContent = `${tally.neutrePct}%`;
-
-          // Justifications list
-          const justifContainer = document.getElementById('admin-justifications-list');
-          const justifItems = state.bulletins.filter((b) => b.justification && b.justification.trim().length > 0);
-          if (justifItems.length === 0) {
-            justifContainer.innerHTML = `<p class="text-slate-400 italic text-center py-4">Aucune justification enregistrée pour le moment.</p>`;
-          } else {
-            justifContainer.innerHTML = justifItems.map((item, idx) => `
-              <div class="p-3 rounded-xl ${item.choice === 'NON' ? 'bg-rose-50 border border-rose-200' : 'bg-amber-50 border border-amber-200'} space-y-1">
-                <div class="flex items-center justify-between">
-                  <span class="font-bold text-[11px] ${item.choice === 'NON' ? 'text-rose-700' : 'text-amber-700'}">
-                    Bulletin anonyme #${idx + 1} — Choix : ${item.choice}
-                  </span>
-                  <span class="text-[10px] text-slate-400">
-                    ${item.timestamp ? new Date(item.timestamp).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : ''}
-                  </span>
-                </div>
-                <p class="text-slate-800 text-xs leading-relaxed italic">"${item.justification}"</p>
-              </div>
-            `).join('');
-          }
-
-          // Electors grid
-          const electorsGrid = document.getElementById('admin-electors-grid');
-          electorsGrid.innerHTML = AUTHORIZED_ELECTORS.map((name) => {
-            const electorData = state.electors[name] || {};
-            const hasVoted = Boolean(electorData.hasVoted);
-            return `
-              <div class="p-2.5 rounded-xl border flex items-center justify-between ${
-                hasVoted ? 'bg-emerald-50/60 border-emerald-300' : 'bg-orange-50/40 border-orange-200'
-              }">
-                <div class="flex items-center gap-2">
-                  <div class="w-2 h-2 rounded-full ${hasVoted ? 'bg-emerald-500' : 'bg-slate-300'}"></div>
-                  <span class="text-xs font-bold text-slate-800">${name}</span>
-                </div>
-                <span class="text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                  hasVoted ? 'bg-emerald-100 text-emerald-800 border border-emerald-300' : 'bg-slate-200 text-slate-600'
-                }">
-                  ${hasVoted ? 'A VOTÉ' : 'EN ATTENTE'}
-                </span>
-              </div>
-            `;
-          }).join('');
+        // If a mobile screen was left on 'enregistre' and the database resets to 0 votes, return automatically to accueil
+        if (state.currentPage === 'enregistre' && tally.total === 0) {
+          showView('accueil');
         }
       }
 
@@ -1310,19 +1300,20 @@
           return;
         }
 
-        // Check local storage duplicate prevention
-        if (getLocalVoted().includes(norm)) {
+        // Check live elector status directly from Firebase Firestore state
+        if (state.electors[norm] && state.electors[norm].hasVoted) {
           electorErrorText.textContent = "Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé.";
           electorErrorBox.classList.remove('hidden');
           return;
         }
 
-        // Check Firestore elector status
+        // Check Firestore elector status across 'voters' and 'electors' in real-time
         try {
-          const electorRef = doc(db, "electors", norm);
-          const snap = await getDoc(electorRef);
-          if (snap.exists() && snap.data().hasVoted) {
-            addLocalVoted(norm);
+          const [voterSnap, electorSnap] = await Promise.all([
+            getDoc(doc(db, "voters", norm)),
+            getDoc(doc(db, "electors", norm))
+          ]);
+          if ((voterSnap.exists() && voterSnap.data().hasVoted) || (electorSnap.exists() && electorSnap.data().hasVoted)) {
             electorErrorText.textContent = "Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé.";
             electorErrorBox.classList.remove('hidden');
             return;
@@ -1491,37 +1482,51 @@
             console.log("Backend API vote notice:", apiErr.message);
           }
 
-          // 2. Also record in Firestore if available
+          // 2. Also record in Firestore
           try {
             const now = new Date().toISOString();
-            const electorRef = doc(db, "electors", state.currentElector);
 
-            // Record ANONYMOUS bulletin in both 'bulletins' and 'votes' collections
+            // Record exactly ONE ANONYMOUS bulletin in the 'votes' collection
+            const votePromise = addDoc(collection(db, "votes"), {
+              choice: state.selectedChoice,
+              justification: state.justification || null,
+              timestamp: now
+            });
+
+            // If a justification was provided, also record in 'justifications' collection
+            const justifPromise = state.justification && state.justification.trim()
+              ? addDoc(collection(db, "justifications"), {
+                  choice: state.selectedChoice,
+                  justification: state.justification.trim(),
+                  timestamp: now
+                })
+              : Promise.resolve();
+
+            // Mark elector as voted in 'voters', 'electors', and 'users' collections
             await Promise.all([
-              addDoc(collection(db, "bulletins"), {
-                choice: state.selectedChoice,
-                justification: state.justification || null,
-                timestamp: now
-              }),
-              addDoc(collection(db, "votes"), {
-                choice: state.selectedChoice,
-                justification: state.justification || null,
-                timestamp: now
-              })
+              votePromise,
+              justifPromise,
+              setDoc(doc(db, "voters", state.currentElector), {
+                name: state.currentElector,
+                hasVoted: true,
+                votedAt: now
+              }, { merge: true }),
+              setDoc(doc(db, "electors", state.currentElector), {
+                name: state.currentElector,
+                hasVoted: true,
+                votedAt: now
+              }, { merge: true }),
+              setDoc(doc(db, "users", state.currentElector), {
+                name: state.currentElector,
+                hasVoted: true,
+                votedAt: now
+              }, { merge: true })
             ]);
-
-            // Mark elector as voted in electors collection
-            await setDoc(electorRef, {
-              name: state.currentElector,
-              hasVoted: true,
-              votedAt: now
-            }, { merge: true });
           } catch (fbErr) {
             console.log("Firestore vote notice:", fbErr.message);
           }
 
-          // 3. Mark in localStorage and local state
-          addLocalVoted(state.currentElector);
+          // 3. Mark in local state (no persistent local storage blocking mobile clients)
           if (state.electors[state.currentElector]) {
             state.electors[state.currentElector].hasVoted = true;
           }
@@ -1688,86 +1693,102 @@
         const btn = document.getElementById('btn-admin-reset-data');
         const origText = btn.innerHTML;
         btn.disabled = true;
-        btn.innerHTML = `<span class="inline-block w-3.5 h-3.5 border-2 border-rose-600/30 border-t-rose-600 rounded-full animate-spin mr-1.5"></span> Nettoyage en cours...`;
+        btn.innerHTML = `<span class="inline-block w-3.5 h-3.5 border-2 border-rose-600/30 border-t-rose-600 rounded-full animate-spin mr-1.5"></span> Réinitialisation en cours...`;
 
         try {
-          // 1. Nettoyage complet dans Firebase Firestore
+          // 1. SUPPRESSION DÉFINITIVE DANS FIREBASE (handleReset) via writeBatch()
+          const batch = writeBatch(db);
+
+          // a. Parcours la collection 'votes' (ou 'bulletins') et ajoute chaque document au batch avec batch.delete(doc.ref)
+          // Supprime également les justifications éventuelles enregistrées (collection 'justifications')
+          const [votesSnap, bulletinsSnap, justifSnap] = await Promise.all([
+            getDocs(collection(db, "votes")),
+            getDocs(collection(db, "bulletins")),
+            getDocs(collection(db, "justifications"))
+          ]);
+
+          votesSnap.forEach((docSnap) => {
+            batch.delete(docSnap.ref);
+          });
+          bulletinsSnap.forEach((docSnap) => {
+            batch.delete(docSnap.ref);
+          });
+          justifSnap.forEach((docSnap) => {
+            batch.delete(docSnap.ref);
+          });
+
+          // b. Mets à jour la collection 'voters' (ou 'users') en remettant hasVoted: false pour TOUS les électeurs
+          const [votersSnap, usersSnap, electorsSnap] = await Promise.all([
+            getDocs(collection(db, "voters")),
+            getDocs(collection(db, "users")),
+            getDocs(collection(db, "electors"))
+          ]);
+
+          votersSnap.forEach((docSnap) => {
+            batch.set(docSnap.ref, { hasVoted: false, votedAt: null }, { merge: true });
+          });
+          usersSnap.forEach((docSnap) => {
+            batch.set(docSnap.ref, { hasVoted: false, votedAt: null }, { merge: true });
+          });
+          electorsSnap.forEach((docSnap) => {
+            batch.set(docSnap.ref, { hasVoted: false, votedAt: null }, { merge: true });
+          });
+
+          // S'assure que les 11 électeurs officiels sont inscrits avec hasVoted: false
+          AUTHORIZED_ELECTORS.forEach((name) => {
+            batch.set(doc(db, "voters", name), { name, hasVoted: false, votedAt: null }, { merge: true });
+            batch.set(doc(db, "electors", name), { name, hasVoted: false, votedAt: null }, { merge: true });
+            batch.set(doc(db, "users", name), { name, hasVoted: false, votedAt: null }, { merge: true });
+          });
+
+          // Scrutin configuration
+          batch.set(doc(db, "scrutin", "config"), {
+            isClosed: false,
+            areResultsPublished: false,
+            candidateName: "WOYA SYLAS",
+            totalElectors: 11
+          }, { merge: true });
+
+          batch.set(doc(db, "scrutin", "results"), {
+            oui: 0,
+            non: 0,
+            neutre: 0,
+            total: 0,
+            updatedAt: new Date().toISOString()
+          }, { merge: true });
+
+          // d. Exécute await batch.commit() pour valider le nettoyage complet à zéro dans la base de données
+          await batch.commit();
+
+          // 2. Nettoyage absolu d'état local (aucun état persistant bloquant)
           try {
-            // A. Supprime TOUS les documents de la collection des votes (bulletins et votes)
-            const [bulletinsSnap, votesSnap] = await Promise.all([
-              getDocs(collection(db, "bulletins")),
-              getDocs(collection(db, "votes"))
-            ]);
+            localStorage.removeItem("rouama_voted_electors_set");
+            localStorage.removeItem("rouama_voted_names");
+            localStorage.removeItem("rouama_last_voter");
+          } catch (storageErr) {}
 
-            const deletePromises = [];
-            bulletinsSnap.forEach((docSnap) => {
-              deletePromises.push(deleteDoc(docSnap.ref));
-            });
-            votesSnap.forEach((docSnap) => {
-              deletePromises.push(deleteDoc(docSnap.ref));
-            });
-            await Promise.all(deletePromises);
-
-            // B. Remets tous les membres de la liste d'émargement au statut 'EN ATTENTE' (hasVoted = false)
-            const electorPromises = AUTHORIZED_ELECTORS.map((name) => {
-              return setDoc(doc(db, "electors", name), {
-                name: name,
-                hasVoted: false,
-                votedAt: null
-              });
-            });
-            await Promise.all(electorPromises);
-
-            // C. Réinitialise les compteurs globaux (oui: 0, non: 0, neutre: 0, total: 0) et config
-            await setDoc(doc(db, "scrutin", "config"), {
-              isClosed: false,
-              areResultsPublished: false,
-              candidateName: "WOYA SYLAS",
-              totalElectors: 11,
-              counters: {
-                oui: 0,
-                non: 0,
-                neutre: 0,
-                total: 0
-              }
-            });
-
-            await setDoc(doc(db, "scrutin", "results"), {
-              oui: 0,
-              non: 0,
-              neutre: 0,
-              total: 0,
-              updatedAt: new Date().toISOString()
-            });
-          } catch (fbErr) {
-            console.warn("Firestore clean-up notice:", fbErr.message);
-          }
-
-          // 2. Backend Server Reset
-          try {
-            await fetch('/api/admin/reset', {
-              method: 'POST',
-              headers: { 'x-admin-code': ADMIN_PIN }
-            });
-          } catch (apiErr) {
-            console.log("Backend API reset note:", apiErr.message);
-          }
-
-          // 3. Clear local storage & state
-          localStorage.removeItem(LS_VOTED_KEY);
-          state.backendResults = { oui: 0, non: 0, neutre: 0, total: 0 };
-          state.bulletins = [];
           state.votes = [];
+          state.currentElector = null;
+          state.selectedChoice = null;
+          state.justification = "";
           AUTHORIZED_ELECTORS.forEach(name => {
             state.electors[name] = { name, hasVoted: false, votedAt: null };
           });
           state.scrutin.isClosed = false;
           state.scrutin.areResultsPublished = false;
 
-          await syncFromBackend();
-          updateUI();
+          // 3. Reset du serveur backend
+          try {
+            await fetch('/api/admin/reset', {
+              method: 'POST',
+              headers: { 'x-admin-code': ADMIN_PIN }
+            });
+          } catch (apiErr) {
+            console.log("Backend API reset notice:", apiErr.message);
+          }
 
-          alert("Le scrutin a été réinitialisé avec succès : tous les électeurs sont repassés 'EN ATTENTE', tous les bulletins ont été supprimés et les compteurs remis à zéro.");
+          updateUI();
+          alert("Le scrutin a été réinitialisé avec succès : tous les bulletins ont été supprimés via writeBatch(), la liste d'émargement est remise à 'EN ATTENTE' et les compteurs sont à 0.");
         } catch (e) {
           alert("Erreur de réinitialisation : " + e.message);
         } finally {
