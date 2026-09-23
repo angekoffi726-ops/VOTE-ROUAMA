@@ -614,7 +614,7 @@ export default function App() {
                       setFirstNameInput(e.target.value);
                       setIdError(null);
                     }}
-                    placeholder="Ex: OTINEL, ESTHER, GILBERT..."
+                    placeholder="Entrez votre prénom..."
                     className="w-full px-4 py-3 bg-orange-50/50 border border-orange-200 rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:bg-white focus:border-orange-500 focus:ring-2 focus:ring-orange-500/20 text-sm font-medium transition-all"
                     autoFocus
                     required

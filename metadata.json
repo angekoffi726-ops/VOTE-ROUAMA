@@ -2,5 +2,7 @@
   "name": "ROUAMA - Scrutin Interne 2026",
   "description": "Plateforme officielle de vote interne du groupe ROUAMA pour l'élection du Payor 2026.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
