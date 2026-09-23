@@ -555,15 +555,10 @@ export default function App() {
             </div>
 
             {/* Scrutin Schedule Info */}
-            <div className="pt-4 flex items-center justify-center gap-6 text-xs text-slate-600 border-t border-orange-200/80 max-w-lg mx-auto">
+            <div className="pt-4 flex items-center justify-center text-xs text-slate-600 border-t border-orange-200/80 max-w-lg mx-auto">
               <div className="flex items-center gap-1.5">
                 <Calendar className="w-3.5 h-3.5 text-orange-600" />
                 <span className="font-medium">Samedi 26 sept. 2026</span>
-              </div>
-              <span className="text-orange-300">·</span>
-              <div className="flex items-center gap-1.5">
-                <Users className="w-3.5 h-3.5 text-orange-600" />
-                <span className="font-medium">Collège électoral : 11 membres</span>
               </div>
             </div>
 

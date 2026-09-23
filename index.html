@@ -148,19 +148,12 @@
           </button>
         </div>
 
-        <div class="pt-4 flex items-center justify-center gap-6 text-xs text-slate-600 border-t border-orange-200/80 max-w-lg mx-auto">
+        <div class="pt-4 flex items-center justify-center text-xs text-slate-600 border-t border-orange-200/80 max-w-lg mx-auto">
           <div class="flex items-center gap-1.5">
             <svg class="w-3.5 h-3.5 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
             </svg>
             <span class="font-medium">Samedi 26 sept. 2026</span>
-          </div>
-          <span class="text-orange-300">·</span>
-          <div class="flex items-center gap-1.5">
-            <svg class="w-3.5 h-3.5 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
-            </svg>
-            <span class="font-medium">Collège électoral : 11 membres</span>
           </div>
         </div>
 
@@ -943,39 +936,103 @@
         }
       }
 
-      // Set up real-time listeners
-      function initRealtimeListeners() {
-        // 1. Scrutin config
-        onSnapshot(doc(db, "scrutin", "config"), (docSnap) => {
-          if (docSnap.exists()) {
-            state.scrutin = { ...state.scrutin, ...docSnap.data() };
+      // Backend API Synchronization
+      async function syncFromBackend() {
+        try {
+          const res = await fetch('/api/status');
+          if (res.ok) {
+            const data = await res.json();
+            if (data.isClosed !== undefined) state.scrutin.isClosed = Boolean(data.isClosed);
+            if (data.areResultsPublished !== undefined) state.scrutin.areResultsPublished = Boolean(data.areResultsPublished);
+            if (data.totalElectors) state.scrutin.totalElectors = data.totalElectors;
+            if (data.results) state.publicResults = data.results;
             updateUI();
           }
-        });
+        } catch (e) {
+          console.log("Backend status note:", e.message);
+        }
 
-        // 2. Electors
-        onSnapshot(collection(db, "electors"), (querySnap) => {
-          const electorsMap = {};
-          querySnap.forEach((doc) => {
-            electorsMap[doc.id] = doc.data();
-          });
-          state.electors = electorsMap;
-          updateUI();
-        });
+        if (state.isAdminLoggedIn) {
+          try {
+            const res = await fetch('/api/admin/dashboard', {
+              headers: { 'x-admin-code': ADMIN_PIN }
+            });
+            if (res.ok) {
+              const d = await res.json();
+              state.scrutin.isClosed = Boolean(d.isClosed);
+              state.scrutin.areResultsPublished = Boolean(d.areResultsPublished);
+              if (d.electors) {
+                const map = {};
+                d.electors.forEach(e => { map[e.name] = e; });
+                state.electors = map;
+              }
+              if (d.justifications) {
+                state.bulletins = d.justifications;
+              }
+              if (d.results) {
+                state.backendResults = d.results;
+              }
+              updateUI();
+            }
+          } catch (e) {
+            console.log("Admin sync note:", e.message);
+          }
+        }
+      }
 
-        // 3. Bulletins (anonymized)
-        onSnapshot(collection(db, "bulletins"), (querySnap) => {
-          const bulletins = [];
-          querySnap.forEach((doc) => {
-            bulletins.push({ id: doc.id, ...doc.data() });
-          });
-          state.bulletins = bulletins;
-          updateUI();
-        });
+      // Set up real-time listeners
+      function initRealtimeListeners() {
+        try {
+          // 1. Scrutin config
+          onSnapshot(doc(db, "scrutin", "config"), (docSnap) => {
+            if (docSnap.exists()) {
+              state.scrutin = { ...state.scrutin, ...docSnap.data() };
+              updateUI();
+            }
+          }, (err) => console.log("Config listener fallback to backend:", err.message));
+
+          // 2. Electors
+          onSnapshot(collection(db, "electors"), (querySnap) => {
+            const electorsMap = {};
+            querySnap.forEach((doc) => {
+              electorsMap[doc.id] = doc.data();
+            });
+            state.electors = electorsMap;
+            updateUI();
+          }, (err) => console.log("Electors listener fallback to backend:", err.message));
+
+          // 3. Bulletins (anonymized)
+          onSnapshot(collection(db, "bulletins"), (querySnap) => {
+            const bulletins = [];
+            querySnap.forEach((doc) => {
+              bulletins.push({ id: doc.id, ...doc.data() });
+            });
+            state.bulletins = bulletins;
+            updateUI();
+          }, (err) => console.log("Bulletins listener fallback to backend:", err.message));
+        } catch (e) {
+          console.log("Firestore setup note:", e.message);
+        }
+
+        // Periodic background sync with backend API
+        syncFromBackend();
+        setInterval(syncFromBackend, 3500);
       }
 
       // Calculate tally
       function getTally() {
+        if (state.backendResults && state.backendResults.total > 0 && state.bulletins.length === 0) {
+          const { oui, non, neutre, total } = state.backendResults;
+          const totalElectors = state.scrutin.totalElectors || 11;
+          const participationPct = totalElectors > 0 ? Math.round((total / totalElectors) * 100) : 0;
+          return {
+            oui, non, neutre, total, totalElectors, participationPct,
+            ouiPct: total > 0 ? Math.round((oui / total) * 100) : 0,
+            nonPct: total > 0 ? Math.round((non / total) * 100) : 0,
+            neutrePct: total > 0 ? Math.round((neutre / total) * 100) : 0
+          };
+        }
+
         let oui = 0;
         let non = 0;
         let neutre = 0;
@@ -984,7 +1041,12 @@
           else if (b.choice === 'NON') non++;
           else if (b.choice === 'NEUTRE') neutre++;
         });
-        const total = state.bulletins.length;
+        const total = state.backendResults && state.backendResults.total > 0 ? state.backendResults.total : state.bulletins.length;
+        if (state.backendResults && state.backendResults.total > 0) {
+          oui = state.backendResults.oui;
+          non = state.backendResults.non;
+          neutre = state.backendResults.neutre;
+        }
         const totalElectors = state.scrutin.totalElectors || 11;
         const participationPct = totalElectors > 0 ? Math.round((total / totalElectors) * 100) : 0;
         return {
@@ -1371,38 +1433,66 @@
         btn.innerHTML = `<span class="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin mr-2"></span> Enregistrement du vote...`;
 
         try {
-          // Double check if scrutin closed
-          const configSnap = await getDoc(doc(db, "scrutin", "config"));
-          if (configSnap.exists() && configSnap.data().isClosed) {
+          // Double check if scrutin closed locally or on Firestore
+          if (state.scrutin.isClosed) {
             throw new Error("Le scrutin a été clôturé entre-temps. Le vote ne peut plus être validé.");
           }
 
-          // Double check if elector has already voted
-          const electorRef = doc(db, "electors", state.currentElector);
-          const electorSnap = await getDoc(electorRef);
-          if (electorSnap.exists() && electorSnap.data().hasVoted) {
-            addLocalVoted(state.currentElector);
-            throw new Error("Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé.");
+          // 1. Submit to Backend API (guaranteed local server disk persistence)
+          try {
+            const apiRes = await fetch('/api/vote', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                firstName: state.currentElector,
+                choice: state.selectedChoice,
+                justification: state.justification || undefined
+              })
+            });
+
+            if (!apiRes.ok) {
+              const errJson = await apiRes.json();
+              if (errJson && errJson.message) {
+                throw new Error(errJson.message);
+              }
+            }
+          } catch (apiErr) {
+            if (apiErr.message.includes('déjà') || apiErr.message.includes('clôturé')) {
+              throw apiErr;
+            }
+            console.log("Backend API vote notice:", apiErr.message);
           }
 
-          const now = new Date().toISOString();
+          // 2. Also record in Firestore if available
+          try {
+            const now = new Date().toISOString();
+            const electorRef = doc(db, "electors", state.currentElector);
 
-          // 1. Record ANONYMOUS bulletin
-          await addDoc(collection(db, "bulletins"), {
-            choice: state.selectedChoice,
-            justification: state.justification || null,
-            timestamp: now
-          });
+            // Record ANONYMOUS bulletin
+            await addDoc(collection(db, "bulletins"), {
+              choice: state.selectedChoice,
+              justification: state.justification || null,
+              timestamp: now
+            });
 
-          // 2. Mark elector as voted in electors collection
-          await setDoc(electorRef, {
-            name: state.currentElector,
-            hasVoted: true,
-            votedAt: now
-          }, { merge: true });
+            // Mark elector as voted in electors collection
+            await setDoc(electorRef, {
+              name: state.currentElector,
+              hasVoted: true,
+              votedAt: now
+            }, { merge: true });
+          } catch (fbErr) {
+            console.log("Firestore vote notice:", fbErr.message);
+          }
 
-          // 3. Mark in localStorage
+          // 3. Mark in localStorage and local state
           addLocalVoted(state.currentElector);
+          if (state.electors[state.currentElector]) {
+            state.electors[state.currentElector].hasVoted = true;
+          }
+
+          // Trigger immediate sync
+          await syncFromBackend();
 
           // Clear temporary elector state
           state.currentElector = null;
@@ -1476,9 +1566,29 @@
         if (!confirm(msg)) return;
 
         try {
-          await updateDoc(doc(db, "scrutin", "config"), {
-            isClosed: willClose
-          });
+          // Backend API
+          try {
+            await fetch(willClose ? '/api/admin/close' : '/api/admin/reopen', {
+              method: 'POST',
+              headers: { 'x-admin-code': ADMIN_PIN }
+            });
+          } catch (apiErr) {
+            console.log("Backend API toggle close note:", apiErr.message);
+          }
+
+          // Firestore
+          try {
+            await updateDoc(doc(db, "scrutin", "config"), {
+              isClosed: willClose
+            });
+          } catch (fbErr) {
+            console.log("Firestore toggle close note:", fbErr.message);
+          }
+
+          state.scrutin.isClosed = willClose;
+          await syncFromBackend();
+          updateUI();
+
           const notice = document.getElementById('admin-notice-box');
           document.getElementById('admin-notice-text').textContent = willClose
             ? "Le scrutin a été clôturé avec succès."
@@ -1503,9 +1613,29 @@
         if (!confirm(msg)) return;
 
         try {
-          await updateDoc(doc(db, "scrutin", "config"), {
-            areResultsPublished: willPublish
-          });
+          // Backend API
+          try {
+            await fetch(willPublish ? '/api/admin/publish' : '/api/admin/unpublish', {
+              method: 'POST',
+              headers: { 'x-admin-code': ADMIN_PIN }
+            });
+          } catch (apiErr) {
+            console.log("Backend API publish note:", apiErr.message);
+          }
+
+          // Firestore
+          try {
+            await updateDoc(doc(db, "scrutin", "config"), {
+              areResultsPublished: willPublish
+            });
+          } catch (fbErr) {
+            console.log("Firestore publish note:", fbErr.message);
+          }
+
+          state.scrutin.areResultsPublished = willPublish;
+          await syncFromBackend();
+          updateUI();
+
           const notice = document.getElementById('admin-notice-box');
           document.getElementById('admin-notice-text').textContent = willPublish
             ? "Les résultats officiels sont désormais publics."
@@ -1521,25 +1651,50 @@
         if (!confirm("ATTENTION : Cette action va réinitialiser l'ensemble des votes et la liste des électeurs pour ce scrutin. Continuer ?")) return;
 
         try {
-          // Reset config
-          await setDoc(doc(db, "scrutin", "config"), {
-            isClosed: false,
-            areResultsPublished: false,
-            candidateName: "WOYA SYLAS",
-            totalElectors: 11
-          });
-
-          // Reset all electors to hasVoted: false
-          for (const name of AUTHORIZED_ELECTORS) {
-            await setDoc(doc(db, "electors", name), {
-              name: name,
-              hasVoted: false,
-              votedAt: null
+          // Backend API
+          try {
+            await fetch('/api/admin/reset', {
+              method: 'POST',
+              headers: { 'x-admin-code': ADMIN_PIN }
             });
+          } catch (apiErr) {
+            console.log("Backend API reset note:", apiErr.message);
           }
 
-          // Clear local storage
+          // Firestore
+          try {
+            // Reset config
+            await setDoc(doc(db, "scrutin", "config"), {
+              isClosed: false,
+              areResultsPublished: false,
+              candidateName: "WOYA SYLAS",
+              totalElectors: 11
+            });
+
+            // Reset all electors to hasVoted: false
+            for (const name of AUTHORIZED_ELECTORS) {
+              await setDoc(doc(db, "electors", name), {
+                name: name,
+                hasVoted: false,
+                votedAt: null
+              });
+            }
+          } catch (fbErr) {
+            console.log("Firestore reset note:", fbErr.message);
+          }
+
+          // Clear local storage & state
           localStorage.removeItem(LS_VOTED_KEY);
+          state.backendResults = null;
+          state.bulletins = [];
+          AUTHORIZED_ELECTORS.forEach(name => {
+            state.electors[name] = { name, hasVoted: false, votedAt: null };
+          });
+          state.scrutin.isClosed = false;
+          state.scrutin.areResultsPublished = false;
+
+          await syncFromBackend();
+          updateUI();
 
           alert("Le scrutin a été remis à zéro avec succès.");
         } catch (e) {
