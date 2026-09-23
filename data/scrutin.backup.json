@@ -1,0 +1,63 @@
+{
+  "electors": [
+    {
+      "id": "otinel",
+      "name": "OTINEL",
+      "hasVoted": false
+    },
+    {
+      "id": "esther",
+      "name": "ESTHER",
+      "hasVoted": false
+    },
+    {
+      "id": "leger",
+      "name": "LEGER",
+      "hasVoted": false
+    },
+    {
+      "id": "roxane",
+      "name": "ROXANE",
+      "hasVoted": false
+    },
+    {
+      "id": "gilbert",
+      "name": "GILBERT",
+      "hasVoted": false
+    },
+    {
+      "id": "emile",
+      "name": "EMILE",
+      "hasVoted": false
+    },
+    {
+      "id": "desire",
+      "name": "DESIRE",
+      "hasVoted": false
+    },
+    {
+      "id": "cyprien",
+      "name": "CYPRIEN",
+      "hasVoted": false
+    },
+    {
+      "id": "ulrich",
+      "name": "ULRICH",
+      "hasVoted": false
+    },
+    {
+      "id": "wilfried",
+      "name": "WILFRIED",
+      "hasVoted": false
+    },
+    {
+      "id": "josiane",
+      "name": "JOSIANE",
+      "hasVoted": false
+    }
+  ],
+  "votes": [],
+  "isClosed": false,
+  "areResultsPublished": false,
+  "lastUpdated": "2026-09-23T14:25:21.389Z"
+}
