@@ -797,6 +797,8 @@
         collection,
         addDoc,
         getDocs,
+        deleteDoc,
+        writeBatch,
         onSnapshot
       } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 
@@ -842,6 +844,8 @@
         },
         electors: {}, // { OTINEL: { name: 'OTINEL', hasVoted: false, votedAt: null } }
         bulletins: [], // [ { id, choice, justification, timestamp } ]
+        votes: [], // [ { id, choice, justification, timestamp } ]
+        backendResults: null,
         currentElector: null,
         selectedChoice: null,
         justification: "",
@@ -915,7 +919,13 @@
               isClosed: false,
               areResultsPublished: false,
               candidateName: "WOYA SYLAS",
-              totalElectors: 11
+              totalElectors: 11,
+              counters: {
+                oui: 0,
+                non: 0,
+                neutre: 0,
+                total: 0
+              }
             });
           }
 
@@ -980,7 +990,7 @@
         }
       }
 
-      // Set up real-time listeners
+      // Set up real-time listeners (Firebase Firestore onSnapshot)
       function initRealtimeListeners() {
         try {
           // 1. Scrutin config
@@ -989,9 +999,9 @@
               state.scrutin = { ...state.scrutin, ...docSnap.data() };
               updateUI();
             }
-          }, (err) => console.log("Config listener fallback to backend:", err.message));
+          }, (err) => console.log("Config listener notice:", err.message));
 
-          // 2. Electors
+          // 2. Écoute en temps réel sur la liste des électeurs
           onSnapshot(collection(db, "electors"), (querySnap) => {
             const electorsMap = {};
             querySnap.forEach((doc) => {
@@ -999,17 +1009,36 @@
             });
             state.electors = electorsMap;
             updateUI();
-          }, (err) => console.log("Electors listener fallback to backend:", err.message));
+          }, (err) => console.log("Electors listener notice:", err.message));
 
-          // 3. Bulletins (anonymized)
+          // 3. Écoute en temps réel sur la collection des bulletins (votes anonymisés)
           onSnapshot(collection(db, "bulletins"), (querySnap) => {
             const bulletins = [];
             querySnap.forEach((doc) => {
               bulletins.push({ id: doc.id, ...doc.data() });
             });
             state.bulletins = bulletins;
+            if (bulletins.length === 0 && (!state.votes || state.votes.length === 0)) {
+              state.backendResults = null;
+            }
             updateUI();
-          }, (err) => console.log("Bulletins listener fallback to backend:", err.message));
+          }, (err) => console.log("Bulletins listener notice:", err.message));
+
+          // 4. Écoute en temps réel sur la collection des votes (votes anonymisés)
+          onSnapshot(collection(db, "votes"), (querySnap) => {
+            const votesList = [];
+            querySnap.forEach((doc) => {
+              votesList.push({ id: doc.id, ...doc.data() });
+            });
+            state.votes = votesList;
+            if (state.bulletins.length === 0 && votesList.length > 0) {
+              state.bulletins = votesList;
+            }
+            if (votesList.length === 0 && state.bulletins.length === 0) {
+              state.backendResults = null;
+            }
+            updateUI();
+          }, (err) => console.log("Votes listener notice:", err.message));
         } catch (e) {
           console.log("Firestore setup note:", e.message);
         }
@@ -1019,34 +1048,33 @@
         setInterval(syncFromBackend, 3500);
       }
 
-      // Calculate tally
+      // Calculate tally (réactif et synchronisé en direct)
       function getTally() {
-        if (state.backendResults && state.backendResults.total > 0 && state.bulletins.length === 0) {
-          const { oui, non, neutre, total } = state.backendResults;
-          const totalElectors = state.scrutin.totalElectors || 11;
-          const participationPct = totalElectors > 0 ? Math.round((total / totalElectors) * 100) : 0;
-          return {
-            oui, non, neutre, total, totalElectors, participationPct,
-            ouiPct: total > 0 ? Math.round((oui / total) * 100) : 0,
-            nonPct: total > 0 ? Math.round((non / total) * 100) : 0,
-            neutrePct: total > 0 ? Math.round((neutre / total) * 100) : 0
-          };
-        }
+        const voteList = (state.bulletins && state.bulletins.length > 0)
+          ? state.bulletins
+          : (state.votes && state.votes.length > 0 ? state.votes : []);
 
         let oui = 0;
         let non = 0;
         let neutre = 0;
-        state.bulletins.forEach((b) => {
-          if (b.choice === 'OUI') oui++;
-          else if (b.choice === 'NON') non++;
-          else if (b.choice === 'NEUTRE') neutre++;
-        });
-        const total = state.backendResults && state.backendResults.total > 0 ? state.backendResults.total : state.bulletins.length;
-        if (state.backendResults && state.backendResults.total > 0) {
-          oui = state.backendResults.oui;
-          non = state.backendResults.non;
-          neutre = state.backendResults.neutre;
+
+        if (voteList.length > 0) {
+          voteList.forEach((b) => {
+            const ch = (b.choice || '').toUpperCase();
+            if (ch === 'OUI') oui++;
+            else if (ch === 'NON') non++;
+            else if (ch === 'NEUTRE') neutre++;
+          });
+        } else if (state.backendResults && state.backendResults.total > 0) {
+          oui = state.backendResults.oui || 0;
+          non = state.backendResults.non || 0;
+          neutre = state.backendResults.neutre || 0;
         }
+
+        const total = (voteList.length > 0)
+          ? voteList.length
+          : (state.backendResults && state.backendResults.total ? state.backendResults.total : 0);
+
         const totalElectors = state.scrutin.totalElectors || 11;
         const participationPct = totalElectors > 0 ? Math.round((total / totalElectors) * 100) : 0;
         return {
@@ -1468,12 +1496,19 @@
             const now = new Date().toISOString();
             const electorRef = doc(db, "electors", state.currentElector);
 
-            // Record ANONYMOUS bulletin
-            await addDoc(collection(db, "bulletins"), {
-              choice: state.selectedChoice,
-              justification: state.justification || null,
-              timestamp: now
-            });
+            // Record ANONYMOUS bulletin in both 'bulletins' and 'votes' collections
+            await Promise.all([
+              addDoc(collection(db, "bulletins"), {
+                choice: state.selectedChoice,
+                justification: state.justification || null,
+                timestamp: now
+              }),
+              addDoc(collection(db, "votes"), {
+                choice: state.selectedChoice,
+                justification: state.justification || null,
+                timestamp: now
+              })
+            ]);
 
             // Mark elector as voted in electors collection
             await setDoc(electorRef, {
@@ -1650,8 +1685,65 @@
       document.getElementById('btn-admin-reset-data').onclick = async () => {
         if (!confirm("ATTENTION : Cette action va réinitialiser l'ensemble des votes et la liste des électeurs pour ce scrutin. Continuer ?")) return;
 
+        const btn = document.getElementById('btn-admin-reset-data');
+        const origText = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = `<span class="inline-block w-3.5 h-3.5 border-2 border-rose-600/30 border-t-rose-600 rounded-full animate-spin mr-1.5"></span> Nettoyage en cours...`;
+
         try {
-          // Backend API
+          // 1. Nettoyage complet dans Firebase Firestore
+          try {
+            // A. Supprime TOUS les documents de la collection des votes (bulletins et votes)
+            const [bulletinsSnap, votesSnap] = await Promise.all([
+              getDocs(collection(db, "bulletins")),
+              getDocs(collection(db, "votes"))
+            ]);
+
+            const deletePromises = [];
+            bulletinsSnap.forEach((docSnap) => {
+              deletePromises.push(deleteDoc(docSnap.ref));
+            });
+            votesSnap.forEach((docSnap) => {
+              deletePromises.push(deleteDoc(docSnap.ref));
+            });
+            await Promise.all(deletePromises);
+
+            // B. Remets tous les membres de la liste d'émargement au statut 'EN ATTENTE' (hasVoted = false)
+            const electorPromises = AUTHORIZED_ELECTORS.map((name) => {
+              return setDoc(doc(db, "electors", name), {
+                name: name,
+                hasVoted: false,
+                votedAt: null
+              });
+            });
+            await Promise.all(electorPromises);
+
+            // C. Réinitialise les compteurs globaux (oui: 0, non: 0, neutre: 0, total: 0) et config
+            await setDoc(doc(db, "scrutin", "config"), {
+              isClosed: false,
+              areResultsPublished: false,
+              candidateName: "WOYA SYLAS",
+              totalElectors: 11,
+              counters: {
+                oui: 0,
+                non: 0,
+                neutre: 0,
+                total: 0
+              }
+            });
+
+            await setDoc(doc(db, "scrutin", "results"), {
+              oui: 0,
+              non: 0,
+              neutre: 0,
+              total: 0,
+              updatedAt: new Date().toISOString()
+            });
+          } catch (fbErr) {
+            console.warn("Firestore clean-up notice:", fbErr.message);
+          }
+
+          // 2. Backend Server Reset
           try {
             await fetch('/api/admin/reset', {
               method: 'POST',
@@ -1661,32 +1753,11 @@
             console.log("Backend API reset note:", apiErr.message);
           }
 
-          // Firestore
-          try {
-            // Reset config
-            await setDoc(doc(db, "scrutin", "config"), {
-              isClosed: false,
-              areResultsPublished: false,
-              candidateName: "WOYA SYLAS",
-              totalElectors: 11
-            });
-
-            // Reset all electors to hasVoted: false
-            for (const name of AUTHORIZED_ELECTORS) {
-              await setDoc(doc(db, "electors", name), {
-                name: name,
-                hasVoted: false,
-                votedAt: null
-              });
-            }
-          } catch (fbErr) {
-            console.log("Firestore reset note:", fbErr.message);
-          }
-
-          // Clear local storage & state
+          // 3. Clear local storage & state
           localStorage.removeItem(LS_VOTED_KEY);
-          state.backendResults = null;
+          state.backendResults = { oui: 0, non: 0, neutre: 0, total: 0 };
           state.bulletins = [];
+          state.votes = [];
           AUTHORIZED_ELECTORS.forEach(name => {
             state.electors[name] = { name, hasVoted: false, votedAt: null };
           });
@@ -1696,9 +1767,12 @@
           await syncFromBackend();
           updateUI();
 
-          alert("Le scrutin a été remis à zéro avec succès.");
+          alert("Le scrutin a été réinitialisé avec succès : tous les électeurs sont repassés 'EN ATTENTE', tous les bulletins ont été supprimés et les compteurs remis à zéro.");
         } catch (e) {
           alert("Erreur de réinitialisation : " + e.message);
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = origText;
         }
       };
 
