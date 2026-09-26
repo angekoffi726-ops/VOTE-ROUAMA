@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, collection, getDocs, writeBatch } from 'firebase/firestore';
+import { getFirestore, collection, getDocs, writeBatch, doc, getDoc, setDoc, addDoc } from 'firebase/firestore';
 import {
   Vote as VoteIcon,
   ShieldCheck,
@@ -199,22 +199,48 @@ export default function App() {
     setIsVerifyingId(true);
     setIdError(null);
 
-    try {
-      const res = await fetch('/api/check-elector', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ firstName: trimmed })
-      });
-      const data = await res.json();
+    const normalized = trimmed
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toUpperCase();
 
-      if (!res.ok) {
-        setIdError(data.message || "Une erreur est survenue lors de l'identification.");
-      } else {
-        setElectorName(data.firstName);
-        setCurrentPage('vote');
+    // Vérification exclusion candidat Sylas
+    if (normalized.includes('SYLAS') || normalized.includes('WOYA')) {
+      setIdError("Sylas est le candidat et ne peut pas voter.");
+      setIsVerifyingId(false);
+      return;
+    }
+
+    const AUTHORIZED = [
+      'OTINEL', 'ESTHER', 'LEGER', 'ROXANE', 'GILBERT',
+      'EMILE', 'DESIRE', 'CYPRIEN', 'ULRICH', 'WILFRIED', 'JOSIANE'
+    ];
+    if (!AUTHORIZED.includes(normalized)) {
+      setIdError(`Le prénom "${trimmed}" ne figure pas sur la liste officielle des 11 électeurs habilités.`);
+      setIsVerifyingId(false);
+      return;
+    }
+
+    try {
+      // 2. VÉRIFICATION STRICTE VIA FIREBASE UNIQUE :
+      // Interroge UNIQUEMENT le document de l'électeur dans Firestore collection 'voters'
+      const voterDocSnap = await getDoc(doc(db, "voters", normalized));
+
+      if (voterDocSnap.exists()) {
+        const voterData = voterDocSnap.data();
+        if (voterData.hasVoted === true) {
+          setIdError("Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé.");
+          return;
+        }
       }
-    } catch {
-      setIdError('Erreur de connexion au serveur. Veuillez réessayer.');
+
+      // Si voterData.hasVoted === false (ce qui est le cas après une réinitialisation),
+      // l'accès au bulletin DOIT être accordé immédiatement, peu importe l'historique du navigateur.
+      setElectorName(normalized);
+      setCurrentPage('vote');
+    } catch (err: any) {
+      console.error("Firestore identification error:", err);
+      setIdError("Erreur lors de la vérification de l'électeur dans la base de données.");
     } finally {
       setIsVerifyingId(false);
     }
@@ -245,29 +271,50 @@ export default function App() {
     setVoteError(null);
 
     try {
-      const res = await fetch('/api/vote', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          firstName: electorName,
-          choice: selectedChoice,
-          justification: selectedChoice !== 'OUI' ? justification.trim() : undefined
-        })
+      const now = new Date().toISOString();
+
+      // Enregistrement direct et prioritaire dans Firestore
+      await addDoc(collection(db, "votes"), {
+        choice: selectedChoice,
+        justification: selectedChoice !== 'OUI' ? justification.trim() : null,
+        timestamp: now
       });
 
-      const data = await res.json();
-
-      if (!res.ok) {
-        setVoteError(data.message || "Impossible d'enregistrer le vote.");
-      } else {
-        // Clear temporary state (no local storage persistence)
-        clearLocalVoterData();
-        setFirstNameInput('');
-        setSelectedChoice(null);
-        setJustification('');
-        await fetchStatus();
-        setCurrentPage('enregistre');
+      if (selectedChoice !== 'OUI' && justification.trim()) {
+        await addDoc(collection(db, "justifications"), {
+          choice: selectedChoice,
+          justification: justification.trim(),
+          timestamp: now
+        });
       }
+
+      // Marquer comme ayant voté dans Firestore
+      await setDoc(doc(db, "voters", electorName), {
+        name: electorName,
+        hasVoted: true,
+        votedAt: now
+      }, { merge: true });
+
+      // Synchronisation secondaire backend (facultative)
+      try {
+        await fetch('/api/vote', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            firstName: electorName,
+            choice: selectedChoice,
+            justification: selectedChoice !== 'OUI' ? justification.trim() : undefined
+          })
+        });
+      } catch (_) {}
+
+      // Clear temporary state (no local storage persistence)
+      clearLocalVoterData();
+      setFirstNameInput('');
+      setSelectedChoice(null);
+      setJustification('');
+      await fetchStatus();
+      setCurrentPage('enregistre');
     } catch {
       setVoteError("Erreur lors de la transmission du vote. Veuillez vérifier votre connexion.");
     } finally {

@@ -1378,35 +1378,23 @@
         const originalBtnHtml = btnSubmit.innerHTML;
         btnSubmit.innerHTML = `<span class="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin mr-2"></span> Vérification en direct sur Firebase...`;
 
-        // 4. VÉRIFICATION EN TEMPS RÉEL SUR FIREBASE EXCLUSIVEMENT
-        // Interrogation directe des collections 'voters', 'users' et 'electors' sur Firestore
+        // 4. VÉRIFICATION STRICTE VIA FIREBASE UNIQUE (collection 'voters')
         // Aucune vérification via localStorage, sessionStorage ou cookies.
         let hasVotedInDb = false;
         try {
-          let snapVoters = null;
-          let snapUsers = null;
-          let snapElectors = null;
-
+          const voterRef = doc(db, "voters", norm);
+          let voterSnap = null;
           try {
-            [snapVoters, snapUsers, snapElectors] = await Promise.all([
-              getDocFromServer(doc(db, "voters", norm)),
-              getDocFromServer(doc(db, "users", norm)),
-              getDocFromServer(doc(db, "electors", norm))
-            ]);
-          } catch (netErr) {
-            [snapVoters, snapUsers, snapElectors] = await Promise.all([
-              getDoc(doc(db, "voters", norm)),
-              getDoc(doc(db, "users", norm)),
-              getDoc(doc(db, "electors", norm))
-            ]);
+            voterSnap = await getDocFromServer(voterRef);
+          } catch (_) {
+            voterSnap = await getDoc(voterRef);
           }
 
-          if (snapVoters && snapVoters.exists() && snapVoters.data()?.hasVoted === true) {
-            hasVotedInDb = true;
-          } else if (snapUsers && snapUsers.exists() && snapUsers.data()?.hasVoted === true) {
-            hasVotedInDb = true;
-          } else if (snapElectors && snapElectors.exists() && snapElectors.data()?.hasVoted === true) {
-            hasVotedInDb = true;
+          if (voterSnap && voterSnap.exists()) {
+            const voterData = voterSnap.data();
+            if (voterData.hasVoted === true) {
+              hasVotedInDb = true;
+            }
           }
         } catch (err) {
           console.error("Erreur de vérification Firebase:", err);
