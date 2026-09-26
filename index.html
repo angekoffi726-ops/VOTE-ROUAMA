@@ -1378,10 +1378,19 @@
         const originalBtnHtml = btnSubmit.innerHTML;
         btnSubmit.innerHTML = `<span class="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin mr-2"></span> Vérification en direct sur Firebase...`;
 
-        // 4. VÉRIFICATION STRICTE VIA FIREBASE UNIQUE (collection 'voters')
+        // 4. VÉRIFICATION STRICTE VIA FIREBASE UNIQUE (collection 'voters' et activeScrutinId)
         // Aucune vérification via localStorage, sessionStorage ou cookies.
         let hasVotedInDb = false;
         try {
+          // Lecture de l'activeScrutinId courant
+          let activeScrutinId = 1;
+          try {
+            const settingsSnap = await getDoc(doc(db, "settings", "currentScrutin"));
+            if (settingsSnap.exists() && typeof settingsSnap.data()?.activeScrutinId === 'number') {
+              activeScrutinId = settingsSnap.data().activeScrutinId;
+            }
+          } catch (_) {}
+
           const voterRef = doc(db, "voters", norm);
           let voterSnap = null;
           try {
@@ -1392,7 +1401,8 @@
 
           if (voterSnap && voterSnap.exists()) {
             const voterData = voterSnap.data();
-            if (voterData.hasVoted === true) {
+            // Vérifie uniquement si l'utilisateur a voté pour ce activeScrutinId précis
+            if (voterData.votesByScrutin && voterData.votesByScrutin[String(activeScrutinId)] === true) {
               hasVotedInDb = true;
             }
           }
@@ -1409,7 +1419,7 @@
           return;
         }
 
-        // Si hasVoted === false (ce qui est le cas après un Reset), l'utilisateur DOIT pouvoir accéder au bulletin, peu importe s'il a déjà voté auparavant sur cet appareil !
+        // Si votesByScrutin[activeScrutinId] est faux ou inexistant (ex: après un Reset), accès accordé immédiatement !
         state.currentElector = norm;
         state.selectedChoice = null;
         state.justification = "";
@@ -1566,8 +1576,18 @@
           try {
             const now = new Date().toISOString();
 
-            // Record exactly ONE ANONYMOUS bulletin in the 'votes' collection
+            // Lire activeScrutinId
+            let activeScrutinId = 1;
+            try {
+              const settingsSnap = await getDoc(doc(db, "settings", "currentScrutin"));
+              if (settingsSnap.exists() && typeof settingsSnap.data()?.activeScrutinId === 'number') {
+                activeScrutinId = settingsSnap.data().activeScrutinId;
+              }
+            } catch (_) {}
+
+            // Record exactly ONE ANONYMOUS bulletin in the 'votes' collection with scrutinId
             const votePromise = addDoc(collection(db, "votes"), {
+              scrutinId: activeScrutinId,
               choice: state.selectedChoice,
               justification: state.justification || null,
               timestamp: now
@@ -1576,30 +1596,37 @@
             // If a justification was provided, also record in 'justifications' collection
             const justifPromise = state.justification && state.justification.trim()
               ? addDoc(collection(db, "justifications"), {
+                  scrutinId: activeScrutinId,
                   choice: state.selectedChoice,
                   justification: state.justification.trim(),
                   timestamp: now
                 })
               : Promise.resolve();
 
-            // Mark elector as voted in 'voters', 'electors', and 'users' collections
+            // Mark elector as voted in 'voters' with votesByScrutin map
             await Promise.all([
               votePromise,
               justifPromise,
               setDoc(doc(db, "voters", state.currentElector), {
                 name: state.currentElector,
                 hasVoted: true,
-                votedAt: now
+                votedAt: now,
+                [`votesByScrutin.${activeScrutinId}`]: true,
+                votesByScrutin: {
+                  [String(activeScrutinId)]: true
+                }
               }, { merge: true }),
               setDoc(doc(db, "electors", state.currentElector), {
                 name: state.currentElector,
                 hasVoted: true,
-                votedAt: now
+                votedAt: now,
+                [`votesByScrutin.${activeScrutinId}`]: true
               }, { merge: true }),
               setDoc(doc(db, "users", state.currentElector), {
                 name: state.currentElector,
                 hasVoted: true,
-                votedAt: now
+                votedAt: now,
+                [`votesByScrutin.${activeScrutinId}`]: true
               }, { merge: true })
             ]);
           } catch (fbErr) {
@@ -1780,14 +1807,28 @@
         }
 
         try {
-          // 1. Supprimer tous les votes de la collection 'votes'
+          // 1. Incrémente activeScrutinId (+1) dans settings/currentScrutin
+          let nextScrutinId = 2;
+          try {
+            const settingsSnap = await getDoc(doc(db, "settings", "currentScrutin"));
+            if (settingsSnap.exists() && typeof settingsSnap.data()?.activeScrutinId === 'number') {
+              nextScrutinId = settingsSnap.data().activeScrutinId + 1;
+            }
+          } catch (_) {}
+
+          await setDoc(doc(db, "settings", "currentScrutin"), {
+            activeScrutinId: nextScrutinId,
+            updatedAt: new Date().toISOString()
+          }, { merge: true });
+
+          // 2. Supprimer tous les votes de la collection 'votes'
           const votesSnapshot = await getDocs(collection(db, "votes"));
           const batch = writeBatch(db);
           votesSnapshot.forEach((doc) => {
             batch.delete(doc.ref);
           });
 
-          // 2. Supprimer toutes les justifications
+          // Supprimer toutes les justifications
           const justifSnapshot = await getDocs(collection(db, "justifications"));
           justifSnapshot.forEach((doc) => {
             batch.delete(doc.ref);
@@ -1804,14 +1845,17 @@
           // 3. Remettre tous les membres à hasVoted: false dans la collection 'voters'
           const votersSnapshot = await getDocs(collection(db, "voters"));
           votersSnapshot.forEach((voterDoc) => {
-            batch.update(voterDoc.ref, { hasVoted: false });
+            batch.update(voterDoc.ref, {
+              hasVoted: false,
+              [`votesByScrutin.${nextScrutinId}`]: false
+            });
           });
 
           // S'assurer que les 11 électeurs officiels sont inscrits et réinitialisés dans 'voters', 'electors', 'users'
           AUTHORIZED_ELECTORS.forEach((name) => {
-            batch.set(doc(db, "voters", name), { name, hasVoted: false, votedAt: null }, { merge: true });
-            batch.set(doc(db, "electors", name), { name, hasVoted: false, votedAt: null }, { merge: true });
-            batch.set(doc(db, "users", name), { name, hasVoted: false, votedAt: null }, { merge: true });
+            batch.set(doc(db, "voters", name), { name, hasVoted: false, votedAt: null, [`votesByScrutin.${nextScrutinId}`]: false }, { merge: true });
+            batch.set(doc(db, "electors", name), { name, hasVoted: false, votedAt: null, [`votesByScrutin.${nextScrutinId}`]: false }, { merge: true });
+            batch.set(doc(db, "users", name), { name, hasVoted: false, votedAt: null, [`votesByScrutin.${nextScrutinId}`]: false }, { merge: true });
           });
 
           // Configuration du scrutin et remise à zéro des résultats
@@ -1859,7 +1903,7 @@
           }
 
           updateUI();
-          alert("Le scrutin a été intégralement réinitialisé !");
+          alert("Nouveau scrutin réinitialisé avec succès !");
         } catch (error) {
           console.error("Erreur lors de la réinitialisation :", error);
           alert("Erreur lors de la réinitialisation : " + (error.message || error));

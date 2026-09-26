@@ -222,20 +222,36 @@ export default function App() {
     }
 
     try {
+      // 1. Lire activeScrutinId depuis Firebase settings/currentScrutin
+      let activeScrutinId = 1;
+      try {
+        const settingsSnap = await getDoc(doc(db, "settings", "currentScrutin"));
+        if (settingsSnap.exists() && typeof settingsSnap.data()?.activeScrutinId === 'number') {
+          activeScrutinId = settingsSnap.data().activeScrutinId;
+        }
+      } catch (err) {
+        console.warn("Notice reading activeScrutinId:", err);
+      }
+
       // 2. VÉRIFICATION STRICTE VIA FIREBASE UNIQUE :
       // Interroge UNIQUEMENT le document de l'électeur dans Firestore collection 'voters'
       const voterDocSnap = await getDoc(doc(db, "voters", normalized));
 
       if (voterDocSnap.exists()) {
         const voterData = voterDocSnap.data();
-        if (voterData.hasVoted === true) {
+        // Vérifie uniquement si l'utilisateur a voté pour ce activeScrutinId précis
+        const hasVotedThisScrutin = Boolean(
+          voterData?.votesByScrutin && voterData.votesByScrutin[String(activeScrutinId)] === true
+        );
+
+        if (hasVotedThisScrutin) {
           setIdError("Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé.");
           return;
         }
       }
 
-      // Si voterData.hasVoted === false (ce qui est le cas après une réinitialisation),
-      // l'accès au bulletin DOIT être accordé immédiatement, peu importe l'historique du navigateur.
+      // Si votesByScrutin[activeScrutinId] est faux ou inexistant, ACCORDE L'ACCÈS AU BULLETIN immédiatement.
+      // Supprime TOUTE dépendance à localStorage ou sessionStorage.
       setElectorName(normalized);
       setCurrentPage('vote');
     } catch (err: any) {
@@ -273,8 +289,18 @@ export default function App() {
     try {
       const now = new Date().toISOString();
 
-      // Enregistrement direct et prioritaire dans Firestore
+      // Lire activeScrutinId
+      let activeScrutinId = 1;
+      try {
+        const settingsSnap = await getDoc(doc(db, "settings", "currentScrutin"));
+        if (settingsSnap.exists() && typeof settingsSnap.data()?.activeScrutinId === 'number') {
+          activeScrutinId = settingsSnap.data().activeScrutinId;
+        }
+      } catch (_) {}
+
+      // Enregistrement direct et prioritaire dans Firestore avec scrutinId
       await addDoc(collection(db, "votes"), {
+        scrutinId: activeScrutinId,
         choice: selectedChoice,
         justification: selectedChoice !== 'OUI' ? justification.trim() : null,
         timestamp: now
@@ -282,17 +308,22 @@ export default function App() {
 
       if (selectedChoice !== 'OUI' && justification.trim()) {
         await addDoc(collection(db, "justifications"), {
+          scrutinId: activeScrutinId,
           choice: selectedChoice,
           justification: justification.trim(),
           timestamp: now
         });
       }
 
-      // Marquer comme ayant voté dans Firestore
+      // Marquer comme ayant voté pour ce scrutinId précis dans Firestore
       await setDoc(doc(db, "voters", electorName), {
         name: electorName,
         hasVoted: true,
-        votedAt: now
+        votedAt: now,
+        [`votesByScrutin.${activeScrutinId}`]: true,
+        votesByScrutin: {
+          [String(activeScrutinId)]: true
+        }
       }, { merge: true });
 
       // Synchronisation secondaire backend (facultative)
@@ -420,26 +451,42 @@ export default function App() {
 
   const handleReset = async () => {
     try {
-      // 1. Supprimer tous les votes de la collection 'votes'
+      // 1. Incrémente activeScrutinId (+1) dans settings/currentScrutin
+      let nextScrutinId = 2;
+      try {
+        const settingsSnap = await getDoc(doc(db, "settings", "currentScrutin"));
+        if (settingsSnap.exists() && typeof settingsSnap.data()?.activeScrutinId === 'number') {
+          nextScrutinId = settingsSnap.data().activeScrutinId + 1;
+        }
+      } catch (_) {}
+
+      await setDoc(doc(db, "settings", "currentScrutin"), {
+        activeScrutinId: nextScrutinId,
+        updatedAt: new Date().toISOString()
+      }, { merge: true });
+
+      // 2. Efface complètement les collections 'votes' et 'justifications' via un batch Firestore
       const votesSnapshot = await getDocs(collection(db, "votes"));
       const batch = writeBatch(db);
       votesSnapshot.forEach((doc) => {
         batch.delete(doc.ref);
       });
 
-      // 2. Supprimer toutes les justifications
       const justifSnapshot = await getDocs(collection(db, "justifications"));
       justifSnapshot.forEach((doc) => {
         batch.delete(doc.ref);
       });
 
-      // 3. Remettre tous les membres à hasVoted: false dans la collection 'voters'
+      // Remettre tous les membres à hasVoted: false dans la collection 'voters'
       const votersSnapshot = await getDocs(collection(db, "voters"));
       votersSnapshot.forEach((voterDoc) => {
-        batch.update(voterDoc.ref, { hasVoted: false });
+        batch.update(voterDoc.ref, {
+          hasVoted: false,
+          [`votesByScrutin.${nextScrutinId}`]: false
+        });
       });
 
-      // 4. Valider la suppression dans Firebase
+      // 3. Valider la suppression dans Firebase
       await batch.commit();
 
       // Reset backend server
@@ -450,15 +497,15 @@ export default function App() {
         });
       } catch (_) {}
 
-      // 5. Effacer la mémoire locale du navigateur (au cas où)
+      // 4. Vide le localStorage du navigateur : localStorage.clear(); sessionStorage.clear();
       try { localStorage.clear(); } catch (_) {}
       try { sessionStorage.clear(); } catch (_) {}
 
-      setAdminActionMessage('Base de données du scrutin réinitialisée.');
+      setAdminActionMessage('Nouveau scrutin réinitialisé avec succès !');
       await fetchAdminData();
       await fetchStatus();
 
-      alert("Le scrutin a été intégralement réinitialisé !");
+      alert("Nouveau scrutin réinitialisé avec succès !");
     } catch (error) {
       console.error("Erreur lors de la réinitialisation :", error);
       alert("Erreur lors de la réinitialisation.");
