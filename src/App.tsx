@@ -77,42 +77,20 @@ interface AdminDashboardData {
   }>;
 }
 
-// LocalStorage helpers for persistence
-const LS_VOTED_NAMES_KEY = 'rouama_voted_electors_set';
-const LS_LAST_VOTER_KEY = 'rouama_last_voted_elector';
-
-function getLocalVotedElectors(): string[] {
+// Helper to ensure clean storage without voter tracking or blocking
+function clearLocalVoterData() {
   try {
-    const raw = localStorage.getItem(LS_VOTED_NAMES_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-
-function addLocalVotedElector(name: string) {
-  try {
-    const current = getLocalVotedElectors();
-    const normalized = name.trim().toUpperCase();
-    if (!current.includes(normalized)) {
-      current.push(normalized);
-      localStorage.setItem(LS_VOTED_NAMES_KEY, JSON.stringify(current));
-    }
-    localStorage.setItem(LS_LAST_VOTER_KEY, normalized);
+    ['rouama_voted_electors_set', 'rouama_last_voted_elector', 'rouama_voted_names', 'rouama_last_voter'].forEach(k => {
+      localStorage.removeItem(k);
+      sessionStorage.removeItem(k);
+    });
   } catch (e) {
-    console.error('LocalStorage write error', e);
+    console.warn('Storage clean error', e);
   }
 }
 
 export default function App() {
-  const [currentPage, setCurrentPage] = useState<Page>(() => {
-    // If user previously completed vote and refreshed, keep showing registered confirmation
-    const lastVoter = localStorage.getItem(LS_LAST_VOTER_KEY);
-    if (lastVoter) {
-      return 'accueil';
-    }
-    return 'accueil';
-  });
+  const [currentPage, setCurrentPage] = useState<Page>('accueil');
 
   const [status, setStatus] = useState<ScrutinStatus | null>(null);
   const [, setIsLoadingStatus] = useState(true);
@@ -171,13 +149,6 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setAdminData(data);
-        // Sync local storage voted list with server state
-        if (data.electors && Array.isArray(data.electors)) {
-          const votedServerNames = data.electors
-            .filter((e: any) => e.hasVoted)
-            .map((e: any) => e.name.toUpperCase());
-          localStorage.setItem(LS_VOTED_NAMES_KEY, JSON.stringify(votedServerNames));
-        }
       } else {
         setAdminToken(null);
         sessionStorage.removeItem('rouama_admin_token');
@@ -189,6 +160,10 @@ export default function App() {
       setIsLoadingAdmin(false);
     }
   };
+
+  useEffect(() => {
+    clearLocalVoterData();
+  }, []);
 
   useEffect(() => {
     if (currentPage === 'admin_dashboard' && adminToken) {
@@ -205,18 +180,6 @@ export default function App() {
       return;
     }
 
-    const normalized = trimmed
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .toUpperCase();
-
-    // Check local storage persistent block first for instant response
-    const locallyVoted = getLocalVotedElectors();
-    if (locallyVoted.includes(normalized)) {
-      setIdError("Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé.");
-      return;
-    }
-
     setIsVerifyingId(true);
     setIdError(null);
 
@@ -230,9 +193,6 @@ export default function App() {
 
       if (!res.ok) {
         setIdError(data.message || "Une erreur est survenue lors de l'identification.");
-        if (data.error === 'ALREADY_VOTED') {
-          addLocalVotedElector(trimmed);
-        }
       } else {
         setElectorName(data.firstName);
         setCurrentPage('vote');
@@ -284,10 +244,8 @@ export default function App() {
       if (!res.ok) {
         setVoteError(data.message || "Impossible d'enregistrer le vote.");
       } else {
-        // Permanently record in localStorage that this elector has voted
-        addLocalVotedElector(electorName);
-
-        // Clear temporary state
+        // Clear temporary state (no local storage persistence)
+        clearLocalVoterData();
         setFirstNameInput('');
         setSelectedChoice(null);
         setJustification('');
@@ -406,8 +364,7 @@ export default function App() {
         headers: { 'x-admin-code': adminToken }
       });
       if (res.ok) {
-        localStorage.removeItem(LS_VOTED_NAMES_KEY);
-        localStorage.removeItem(LS_LAST_VOTER_KEY);
+        clearLocalVoterData();
         setAdminActionMessage('Base de données du scrutin réinitialisée.');
         await fetchAdminData();
         await fetchStatus();

@@ -792,6 +792,7 @@
         getFirestore,
         doc,
         getDoc,
+        getDocFromServer,
         setDoc,
         updateDoc,
         collection,
@@ -832,14 +833,42 @@
       ];
       const ADMIN_PIN = "84";
 
-      // Purge any legacy persistent storage that could block mobile refresh
-      try {
-        localStorage.removeItem("rouama_voted_electors_set");
-        localStorage.removeItem("rouama_voted_names");
-        localStorage.removeItem("rouama_last_voter");
-      } catch (e) {
-        console.warn("Storage cleanup notice:", e);
+      // Absolute purge of any local storage, session storage, or cookies that could track or block voters
+      function clearLocalVoterData() {
+        try {
+          const keys = [
+            "rouama_voted_electors_set",
+            "rouama_voted_names",
+            "rouama_last_voter",
+            "rouama_last_voted_elector",
+            "voted_electors",
+            "has_voted",
+            "voter_name",
+            "elector_name",
+            "rouama_voter",
+            "rouama_vote"
+          ];
+          keys.forEach(k => {
+            try { localStorage.removeItem(k); } catch (_) {}
+            try { sessionStorage.removeItem(k); } catch (_) {}
+          });
+          // Also clear cookies
+          if (typeof document !== 'undefined' && document.cookie) {
+            document.cookie.split(";").forEach(c => {
+              const eq = c.indexOf("=");
+              const name = eq > -1 ? c.substring(0, eq).trim() : c.trim();
+              if (name && name !== 'rouama_admin_auth') {
+                document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/";
+              }
+            });
+          }
+        } catch (e) {
+          console.warn("Storage cleanup note:", e);
+        }
       }
+
+      // Execute storage purge on startup (no persistent local storage blocking voters)
+      clearLocalVoterData();
 
       // Application State (Pure real-time, no persistent voter blocking)
       let state = {
@@ -870,6 +899,13 @@
       // View Router
       function showView(viewId) {
         state.currentPage = viewId;
+        if (viewId === 'identification') {
+          clearLocalVoterData();
+          const inputEl = document.getElementById('input-elector-name');
+          if (inputEl) inputEl.value = '';
+          const errBox = document.getElementById('elector-error-box');
+          if (errBox) errBox.classList.add('hidden');
+        }
         const views = [
           'view-accueil',
           'view-identification',
@@ -976,22 +1012,33 @@
             }
           }, (err) => console.log("Config listener notice:", err.message));
 
-          // 2. Écoute en temps réel sur la liste des électeurs ('voters' et 'electors')
+          // 2. Écoute en temps réel sur la liste des électeurs ('voters', 'users' et 'electors')
           onSnapshot(collection(db, "voters"), (querySnap) => {
             if (!querySnap.empty) {
               const electorsMap = { ...state.electors };
               querySnap.forEach((doc) => {
-                electorsMap[doc.id] = doc.data();
+                electorsMap[doc.id] = { ...electorsMap[doc.id], ...doc.data() };
               });
               state.electors = electorsMap;
               updateUI();
             }
           }, (err) => console.log("Voters listener notice:", err.message));
 
+          onSnapshot(collection(db, "users"), (querySnap) => {
+            if (!querySnap.empty) {
+              const electorsMap = { ...state.electors };
+              querySnap.forEach((doc) => {
+                electorsMap[doc.id] = { ...electorsMap[doc.id], ...doc.data() };
+              });
+              state.electors = electorsMap;
+              updateUI();
+            }
+          }, (err) => console.log("Users listener notice:", err.message));
+
           onSnapshot(collection(db, "electors"), (querySnap) => {
             const electorsMap = { ...state.electors };
             querySnap.forEach((doc) => {
-              electorsMap[doc.id] = doc.data();
+              electorsMap[doc.id] = { ...electorsMap[doc.id], ...doc.data() };
             });
             state.electors = electorsMap;
             updateUI();
@@ -1005,6 +1052,28 @@
               votesList.push({ id: doc.id, ...doc.data() });
             });
             state.votes = votesList;
+
+            // Détection instantanée d'une réinitialisation sur un autre appareil (PC ou Mobile)
+            if (votesList.length === 0) {
+              clearLocalVoterData();
+              AUTHORIZED_ELECTORS.forEach(name => {
+                if (state.electors[name]) {
+                  state.electors[name].hasVoted = false;
+                  state.electors[name].votedAt = null;
+                } else {
+                  state.electors[name] = { name, hasVoted: false, votedAt: null };
+                }
+              });
+
+              // Si le smartphone ou PC était resté sur l'écran de vote ou de confirmation, retour immédiat à l'accueil
+              if (state.currentPage === 'enregistre' || state.currentPage === 'vote' || state.currentPage === 'confirmation') {
+                state.currentElector = null;
+                state.selectedChoice = null;
+                state.justification = "";
+                showView('accueil');
+              }
+            }
+
             updateUI();
           }, (err) => console.log("Votes listener notice:", err.message));
 
@@ -1276,7 +1345,10 @@
         e.preventDefault();
         electorErrorBox.classList.add('hidden');
 
-        // Check if scrutin is closed
+        // Nettoyage de tout dépôt persistant sur l'appareil
+        clearLocalVoterData();
+
+        // 1. Vérification si le scrutin est clôturé
         if (state.scrutin.isClosed) {
           electorErrorText.textContent = "Le scrutin est actuellement clôturé. Les votes ne sont plus acceptés.";
           electorErrorBox.classList.remove('hidden');
@@ -1286,46 +1358,76 @@
         const raw = inputElectorName.value;
         const norm = normalizeName(raw);
 
-        // Check if SYLAS
+        // 2. Vérification d'exclusion de Sylas (candidat)
         if (norm === 'SYLAS' || norm === 'WOYA SYLAS') {
           electorErrorText.textContent = "Sylas est le candidat au poste de Payor et ne fait pas partie du collège électoral.";
           electorErrorBox.classList.remove('hidden');
           return;
         }
 
-        // Check authorized list
+        // 3. Vérification de la liste officielle des 11 électeurs
         if (!AUTHORIZED_ELECTORS.includes(norm)) {
           electorErrorText.textContent = `Le prénom "${raw.trim()}" ne figure pas sur la liste officielle des 11 électeurs habilités.`;
           electorErrorBox.classList.remove('hidden');
           return;
         }
 
-        // Check live elector status directly from Firebase Firestore state
-        if (state.electors[norm] && state.electors[norm].hasVoted) {
+        // Indicateur visuel de chargement sur le bouton
+        const btnSubmit = document.getElementById('btn-submit-identification');
+        btnSubmit.disabled = true;
+        const originalBtnHtml = btnSubmit.innerHTML;
+        btnSubmit.innerHTML = `<span class="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin mr-2"></span> Vérification en direct sur Firebase...`;
+
+        // 4. VÉRIFICATION EN TEMPS RÉEL SUR FIREBASE EXCLUSIVEMENT
+        // Interrogation directe des collections 'voters', 'users' et 'electors' sur Firestore
+        // Aucune vérification via localStorage, sessionStorage ou cookies.
+        let hasVotedInDb = false;
+        try {
+          let snapVoters = null;
+          let snapUsers = null;
+          let snapElectors = null;
+
+          try {
+            [snapVoters, snapUsers, snapElectors] = await Promise.all([
+              getDocFromServer(doc(db, "voters", norm)),
+              getDocFromServer(doc(db, "users", norm)),
+              getDocFromServer(doc(db, "electors", norm))
+            ]);
+          } catch (netErr) {
+            [snapVoters, snapUsers, snapElectors] = await Promise.all([
+              getDoc(doc(db, "voters", norm)),
+              getDoc(doc(db, "users", norm)),
+              getDoc(doc(db, "electors", norm))
+            ]);
+          }
+
+          if (snapVoters && snapVoters.exists() && snapVoters.data()?.hasVoted === true) {
+            hasVotedInDb = true;
+          } else if (snapUsers && snapUsers.exists() && snapUsers.data()?.hasVoted === true) {
+            hasVotedInDb = true;
+          } else if (snapElectors && snapElectors.exists() && snapElectors.data()?.hasVoted === true) {
+            hasVotedInDb = true;
+          }
+        } catch (err) {
+          console.error("Erreur de vérification Firebase:", err);
+        } finally {
+          btnSubmit.disabled = false;
+          btnSubmit.innerHTML = originalBtnHtml;
+        }
+
+        if (hasVotedInDb) {
           electorErrorText.textContent = "Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé.";
           electorErrorBox.classList.remove('hidden');
           return;
         }
 
-        // Check Firestore elector status across 'voters' and 'electors' in real-time
-        try {
-          const [voterSnap, electorSnap] = await Promise.all([
-            getDoc(doc(db, "voters", norm)),
-            getDoc(doc(db, "electors", norm))
-          ]);
-          if ((voterSnap.exists() && voterSnap.data().hasVoted) || (electorSnap.exists() && electorSnap.data().hasVoted)) {
-            electorErrorText.textContent = "Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé.";
-            electorErrorBox.classList.remove('hidden');
-            return;
-          }
-        } catch (err) {
-          console.error("Firestore verify error:", err);
-        }
-
-        // All good, proceed to vote view
+        // Si hasVoted === false (ce qui est le cas après un Reset), l'utilisateur DOIT pouvoir accéder au bulletin, peu importe s'il a déjà voté auparavant sur cet appareil !
         state.currentElector = norm;
         state.selectedChoice = null;
         state.justification = "";
+        if (state.electors[norm]) {
+          state.electors[norm].hasVoted = false;
+        }
         document.getElementById('voter-badge-name').textContent = norm;
         resetVoteCards();
         showView('vote');
@@ -1457,9 +1559,9 @@
             throw new Error("Le scrutin a été clôturé entre-temps. Le vote ne peut plus être validé.");
           }
 
-          // 1. Submit to Backend API (guaranteed local server disk persistence)
+          // 1. Submit to Backend API (synchronisation secondaire facultative)
           try {
-            const apiRes = await fetch('/api/vote', {
+            await fetch('/api/vote', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -1468,21 +1570,11 @@
                 justification: state.justification || undefined
               })
             });
-
-            if (!apiRes.ok) {
-              const errJson = await apiRes.json();
-              if (errJson && errJson.message) {
-                throw new Error(errJson.message);
-              }
-            }
           } catch (apiErr) {
-            if (apiErr.message.includes('déjà') || apiErr.message.includes('clôturé')) {
-              throw apiErr;
-            }
             console.log("Backend API vote notice:", apiErr.message);
           }
 
-          // 2. Also record in Firestore
+          // 2. Enregistrement direct et prioritaire dans Firestore
           try {
             const now = new Date().toISOString();
 
@@ -1523,10 +1615,13 @@
               }, { merge: true })
             ]);
           } catch (fbErr) {
-            console.log("Firestore vote notice:", fbErr.message);
+            console.error("Firestore vote error:", fbErr.message);
+            throw new Error("Erreur de connexion Firebase lors de l'enregistrement du bulletin.");
           }
 
-          // 3. Mark in local state (no persistent local storage blocking mobile clients)
+          // 3. Purge immédiate de toute mémoire locale (aucun état persistant bloquant)
+          clearLocalVoterData();
+
           if (state.electors[state.currentElector]) {
             state.electors[state.currentElector].hasVoted = true;
           }
@@ -1761,11 +1856,7 @@
           await batch.commit();
 
           // 2. Nettoyage absolu d'état local (aucun état persistant bloquant)
-          try {
-            localStorage.removeItem("rouama_voted_electors_set");
-            localStorage.removeItem("rouama_voted_names");
-            localStorage.removeItem("rouama_last_voter");
-          } catch (storageErr) {}
+          clearLocalVoterData();
 
           state.votes = [];
           state.currentElector = null;
@@ -1799,6 +1890,7 @@
 
       // Start application
       (async function initApp() {
+        clearLocalVoterData();
         await bootstrapFirestore();
         initRealtimeListeners();
         showView('accueil');

@@ -190,11 +190,15 @@ app.post('/api/check-elector', (req: Request, res: Response) => {
   }
 
   if (elector.hasVoted) {
-    res.status(403).json({
-      error: 'ALREADY_VOTED',
-      message: "Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé."
-    });
-    return;
+    if (store.votes.length === 0) {
+      elector.hasVoted = false;
+    } else {
+      res.status(403).json({
+        error: 'ALREADY_VOTED',
+        message: "Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé."
+      });
+      return;
+    }
   }
 
   if (store.isClosed) {
@@ -258,11 +262,15 @@ app.post('/api/vote', (req: Request, res: Response) => {
 
   const elector = store.electors[electorIndex];
   if (elector.hasVoted) {
-    res.status(403).json({
-      error: 'ALREADY_VOTED',
-      message: "Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé."
-    });
-    return;
+    if (store.votes.length === 0) {
+      elector.hasVoted = false;
+    } else {
+      res.status(403).json({
+        error: 'ALREADY_VOTED',
+        message: "Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé."
+      });
+      return;
+    }
   }
 
   if (!['OUI', 'NON', 'NEUTRE'].includes(choice)) {
