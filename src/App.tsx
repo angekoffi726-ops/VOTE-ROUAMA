@@ -179,6 +179,22 @@ export default function App() {
 
   useEffect(() => {
     clearLocalVoterData();
+
+    // Destruction des Service Workers et vidage du CacheStorage
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then((registrations) => {
+        for (let registration of registrations) {
+          registration.unregister();
+        }
+      });
+    }
+    if ('caches' in window) {
+      caches.keys().then((names) => {
+        for (let name of names) {
+          caches.delete(name);
+        }
+      });
+    }
   }, []);
 
   useEffect(() => {

@@ -8,6 +8,14 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const DATA_FILE = path.join(DATA_DIR, 'scrutin.json');
 
+// Anti-cache HTTP middleware
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
+
 app.use(express.json());
 
 // List of the 11 authorized electors
