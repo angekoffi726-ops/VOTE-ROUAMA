@@ -810,6 +810,8 @@
       import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
       import {
         getFirestore,
+        initializeFirestore,
+        memoryLocalCache,
         doc,
         getDoc,
         getDocFromServer,
@@ -835,7 +837,13 @@
       };
 
       const app = initializeApp(firebaseConfig);
-      const db = getFirestore(app);
+      let dbInstance;
+      try {
+        dbInstance = initializeFirestore(app, { localCache: memoryLocalCache() });
+      } catch (_) {
+        dbInstance = getFirestore(app);
+      }
+      const db = dbInstance;
 
       // Constants
       const AUTHORIZED_ELECTORS = [
@@ -1420,9 +1428,8 @@
           }
 
           if (voterSnap && voterSnap.exists()) {
-            const voterData = voterSnap.data();
-            // Vérifie uniquement si l'utilisateur a voté pour ce activeScrutinId précis
-            if (voterData.votesByScrutin && voterData.votesByScrutin[String(activeScrutinId)] === true) {
+            const data = voterSnap.data();
+            if (data.hasVoted === true) {
               hasVotedInDb = true;
             }
           }

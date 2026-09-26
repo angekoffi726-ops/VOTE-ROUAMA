@@ -1,6 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, collection, getDocs, writeBatch, doc, getDoc, setDoc, addDoc } from 'firebase/firestore';
+import {
+  getFirestore,
+  initializeFirestore,
+  memoryLocalCache,
+  collection,
+  getDocs,
+  writeBatch,
+  doc,
+  getDoc,
+  getDocFromServer,
+  setDoc,
+  addDoc
+} from 'firebase/firestore';
 import {
   Vote as VoteIcon,
   ShieldCheck,
@@ -91,7 +103,31 @@ const firebaseConfig = {
 };
 
 const fbApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(fbApp);
+let dbInstance;
+try {
+  dbInstance = initializeFirestore(fbApp, { localCache: memoryLocalCache() });
+} catch (_) {
+  dbInstance = getFirestore(fbApp);
+}
+const db = dbInstance;
+
+// Désinscription des Service Workers et vidage de CacheStorage sur mobile
+if (typeof window !== 'undefined') {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistrations().then((registrations) => {
+      for (let registration of registrations) {
+        registration.unregister();
+      }
+    });
+  }
+  if ('caches' in window) {
+    caches.keys().then((names) => {
+      for (let name of names) {
+        caches.delete(name);
+      }
+    });
+  }
+}
 
 // Helper to ensure clean storage without voter tracking or blocking
 function clearLocalVoterData() {
@@ -238,36 +274,26 @@ export default function App() {
     }
 
     try {
-      // 1. Lire activeScrutinId depuis Firebase settings/currentScrutin
-      let activeScrutinId = 1;
+      // FORCER LA LECTURE SERVEUR :
+      // Interroge impérativement getDocFromServer pour contourner tout cache Firestore
+      const voterRef = doc(db, 'voters', normalized);
+      let voterSnap: any = null;
       try {
-        const settingsSnap = await getDoc(doc(db, "settings", "currentScrutin"));
-        if (settingsSnap.exists() && typeof settingsSnap.data()?.activeScrutinId === 'number') {
-          activeScrutinId = settingsSnap.data().activeScrutinId;
-        }
-      } catch (err) {
-        console.warn("Notice reading activeScrutinId:", err);
+        voterSnap = await getDocFromServer(voterRef);
+      } catch (srvErr) {
+        console.warn("getDocFromServer fallback to getDoc:", srvErr);
+        voterSnap = await getDoc(voterRef);
       }
 
-      // 2. VÉRIFICATION STRICTE VIA FIREBASE UNIQUE :
-      // Interroge UNIQUEMENT le document de l'électeur dans Firestore collection 'voters'
-      const voterDocSnap = await getDoc(doc(db, "voters", normalized));
-
-      if (voterDocSnap.exists()) {
-        const voterData = voterDocSnap.data();
-        // Vérifie uniquement si l'utilisateur a voté pour ce activeScrutinId précis
-        const hasVotedThisScrutin = Boolean(
-          voterData?.votesByScrutin && voterData.votesByScrutin[String(activeScrutinId)] === true
-        );
-
-        if (hasVotedThisScrutin) {
+      if (voterSnap && voterSnap.exists()) {
+        const data = voterSnap.data();
+        if (data.hasVoted === true) {
           setIdError("Vous avez déjà participé à ce scrutin. Un second vote n'est pas autorisé.");
           return;
         }
       }
 
-      // Si votesByScrutin[activeScrutinId] est faux ou inexistant, ACCORDE L'ACCÈS AU BULLETIN immédiatement.
-      // Supprime TOUTE dépendance à localStorage ou sessionStorage.
+      // Si data.hasVoted !== true (cas après réinitialisation du scrutin), accorde l'accès immédiatement
       setElectorName(normalized);
       setCurrentPage('vote');
     } catch (err: any) {
