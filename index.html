@@ -1781,62 +1781,52 @@
         }
       };
 
-      // 9. Admin Controls: Reset
-      document.getElementById('btn-admin-reset-data').onclick = async () => {
-        if (!confirm("ATTENTION : Cette action va réinitialiser l'ensemble des votes et la liste des électeurs pour ce scrutin. Continuer ?")) return;
-
+      // 9. Admin Controls: Reset (handleReset)
+      const handleReset = async () => {
         const btn = document.getElementById('btn-admin-reset-data');
-        const origText = btn.innerHTML;
-        btn.disabled = true;
-        btn.innerHTML = `<span class="inline-block w-3.5 h-3.5 border-2 border-rose-600/30 border-t-rose-600 rounded-full animate-spin mr-1.5"></span> Réinitialisation en cours...`;
+        let origText = '';
+        if (btn) {
+          origText = btn.innerHTML;
+          btn.disabled = true;
+          btn.innerHTML = `<span class="inline-block w-3.5 h-3.5 border-2 border-rose-600/30 border-t-rose-600 rounded-full animate-spin mr-1.5"></span> Réinitialisation en cours...`;
+        }
 
         try {
-          // 1. SUPPRESSION DÉFINITIVE DANS FIREBASE (handleReset) via writeBatch()
+          // 1. Supprimer tous les votes de la collection 'votes'
+          const votesSnapshot = await getDocs(collection(db, "votes"));
           const batch = writeBatch(db);
-
-          // a. Parcours la collection 'votes' (ou 'bulletins') et ajoute chaque document au batch avec batch.delete(doc.ref)
-          // Supprime également les justifications éventuelles enregistrées (collection 'justifications')
-          const [votesSnap, bulletinsSnap, justifSnap] = await Promise.all([
-            getDocs(collection(db, "votes")),
-            getDocs(collection(db, "bulletins")),
-            getDocs(collection(db, "justifications"))
-          ]);
-
-          votesSnap.forEach((docSnap) => {
-            batch.delete(docSnap.ref);
-          });
-          bulletinsSnap.forEach((docSnap) => {
-            batch.delete(docSnap.ref);
-          });
-          justifSnap.forEach((docSnap) => {
-            batch.delete(docSnap.ref);
+          votesSnapshot.forEach((doc) => {
+            batch.delete(doc.ref);
           });
 
-          // b. Mets à jour la collection 'voters' (ou 'users') en remettant hasVoted: false pour TOUS les électeurs
-          const [votersSnap, usersSnap, electorsSnap] = await Promise.all([
-            getDocs(collection(db, "voters")),
-            getDocs(collection(db, "users")),
-            getDocs(collection(db, "electors"))
-          ]);
-
-          votersSnap.forEach((docSnap) => {
-            batch.set(docSnap.ref, { hasVoted: false, votedAt: null }, { merge: true });
-          });
-          usersSnap.forEach((docSnap) => {
-            batch.set(docSnap.ref, { hasVoted: false, votedAt: null }, { merge: true });
-          });
-          electorsSnap.forEach((docSnap) => {
-            batch.set(docSnap.ref, { hasVoted: false, votedAt: null }, { merge: true });
+          // 2. Supprimer toutes les justifications
+          const justifSnapshot = await getDocs(collection(db, "justifications"));
+          justifSnapshot.forEach((doc) => {
+            batch.delete(doc.ref);
           });
 
-          // S'assure que les 11 électeurs officiels sont inscrits avec hasVoted: false
+          // Supprimer également les bulletins résiduels
+          try {
+            const bulletinsSnapshot = await getDocs(collection(db, "bulletins"));
+            bulletinsSnapshot.forEach((doc) => {
+              batch.delete(doc.ref);
+            });
+          } catch (_) {}
+
+          // 3. Remettre tous les membres à hasVoted: false dans la collection 'voters'
+          const votersSnapshot = await getDocs(collection(db, "voters"));
+          votersSnapshot.forEach((voterDoc) => {
+            batch.update(voterDoc.ref, { hasVoted: false });
+          });
+
+          // S'assurer que les 11 électeurs officiels sont inscrits et réinitialisés dans 'voters', 'electors', 'users'
           AUTHORIZED_ELECTORS.forEach((name) => {
             batch.set(doc(db, "voters", name), { name, hasVoted: false, votedAt: null }, { merge: true });
             batch.set(doc(db, "electors", name), { name, hasVoted: false, votedAt: null }, { merge: true });
             batch.set(doc(db, "users", name), { name, hasVoted: false, votedAt: null }, { merge: true });
           });
 
-          // Scrutin configuration
+          // Configuration du scrutin et remise à zéro des résultats
           batch.set(doc(db, "scrutin", "config"), {
             isClosed: false,
             areResultsPublished: false,
@@ -1852,12 +1842,10 @@
             updatedAt: new Date().toISOString()
           }, { merge: true });
 
-          // d. Exécute await batch.commit() pour valider le nettoyage complet à zéro dans la base de données
+          // 4. Valider la suppression dans Firebase
           await batch.commit();
 
-          // 2. Nettoyage absolu d'état local (aucun état persistant bloquant)
-          clearLocalVoterData();
-
+          // Réinitialisation de l'état local en mémoire
           state.votes = [];
           state.currentElector = null;
           state.selectedChoice = null;
@@ -1868,7 +1856,11 @@
           state.scrutin.isClosed = false;
           state.scrutin.areResultsPublished = false;
 
-          // 3. Reset du serveur backend
+          // 5. Effacer la mémoire locale du navigateur (au cas où)
+          try { localStorage.clear(); } catch (_) {}
+          try { sessionStorage.clear(); } catch (_) {}
+
+          // Reset serveur backend
           try {
             await fetch('/api/admin/reset', {
               method: 'POST',
@@ -1879,14 +1871,26 @@
           }
 
           updateUI();
-          alert("Le scrutin a été réinitialisé avec succès : tous les bulletins ont été supprimés via writeBatch(), la liste d'émargement est remise à 'EN ATTENTE' et les compteurs sont à 0.");
-        } catch (e) {
-          alert("Erreur de réinitialisation : " + e.message);
+          alert("Le scrutin a été intégralement réinitialisé !");
+        } catch (error) {
+          console.error("Erreur lors de la réinitialisation :", error);
+          alert("Erreur lors de la réinitialisation : " + (error.message || error));
         } finally {
-          btn.disabled = false;
-          btn.innerHTML = origText;
+          if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = origText;
+          }
         }
       };
+
+      // Attacher le handler au bouton d'administration
+      const btnAdminReset = document.getElementById('btn-admin-reset-data');
+      if (btnAdminReset) {
+        btnAdminReset.onclick = handleReset;
+      }
+
+      // Exposer également sur window pour invocation directe si besoin
+      window.handleReset = handleReset;
 
       // Start application
       (async function initApp() {

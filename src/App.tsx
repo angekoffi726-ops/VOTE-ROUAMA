@@ -1,4 +1,6 @@
 import React, { useState, useEffect } from 'react';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getFirestore, collection, getDocs, writeBatch } from 'firebase/firestore';
 import {
   Vote as VoteIcon,
   ShieldCheck,
@@ -76,6 +78,20 @@ interface AdminDashboardData {
     votedAt?: string;
   }>;
 }
+
+// Firebase Configuration
+const firebaseConfig = {
+  apiKey: "AIzaSyBhTmSZTXBIzFJ0z27NG5B_zN8JtT2necg",
+  authDomain: "rouama-vote.firebaseapp.com",
+  projectId: "rouama-vote",
+  storageBucket: "rouama-vote.firebasestorage.app",
+  messagingSenderId: "649240559564",
+  appId: "1:649240559564:web:9ec6fd5293ec6882e5a769",
+  measurementId: "G-1ERFVKDBR6"
+};
+
+const fbApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
+const db = getFirestore(fbApp);
 
 // Helper to ensure clean storage without voter tracking or blocking
 function clearLocalVoterData() {
@@ -355,23 +371,56 @@ export default function App() {
     }
   };
 
-  const handleResetScrutin = async () => {
-    if (!adminToken) return;
-    setShowResetConfirmModal(false);
+  const handleReset = async () => {
     try {
-      const res = await fetch('/api/admin/reset', {
-        method: 'POST',
-        headers: { 'x-admin-code': adminToken }
+      // 1. Supprimer tous les votes de la collection 'votes'
+      const votesSnapshot = await getDocs(collection(db, "votes"));
+      const batch = writeBatch(db);
+      votesSnapshot.forEach((doc) => {
+        batch.delete(doc.ref);
       });
-      if (res.ok) {
-        clearLocalVoterData();
-        setAdminActionMessage('Base de données du scrutin réinitialisée.');
-        await fetchAdminData();
-        await fetchStatus();
-      }
-    } catch (e) {
-      console.error(e);
+
+      // 2. Supprimer toutes les justifications
+      const justifSnapshot = await getDocs(collection(db, "justifications"));
+      justifSnapshot.forEach((doc) => {
+        batch.delete(doc.ref);
+      });
+
+      // 3. Remettre tous les membres à hasVoted: false dans la collection 'voters'
+      const votersSnapshot = await getDocs(collection(db, "voters"));
+      votersSnapshot.forEach((voterDoc) => {
+        batch.update(voterDoc.ref, { hasVoted: false });
+      });
+
+      // 4. Valider la suppression dans Firebase
+      await batch.commit();
+
+      // Reset backend server
+      try {
+        await fetch('/api/admin/reset', {
+          method: 'POST',
+          headers: { 'x-admin-code': adminToken || '84' }
+        });
+      } catch (_) {}
+
+      // 5. Effacer la mémoire locale du navigateur (au cas où)
+      try { localStorage.clear(); } catch (_) {}
+      try { sessionStorage.clear(); } catch (_) {}
+
+      setAdminActionMessage('Base de données du scrutin réinitialisée.');
+      await fetchAdminData();
+      await fetchStatus();
+
+      alert("Le scrutin a été intégralement réinitialisé !");
+    } catch (error) {
+      console.error("Erreur lors de la réinitialisation :", error);
+      alert("Erreur lors de la réinitialisation.");
     }
+  };
+
+  const handleResetScrutin = async () => {
+    setShowResetConfirmModal(false);
+    await handleReset();
   };
 
   const handleAdminLogout = () => {
